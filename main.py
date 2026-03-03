@@ -2,14 +2,16 @@ import os
 import sys
 import json
 import argparse
+import logging
 import tempfile
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 import uvicorn
 from markitdown import MarkItDown
+import docling_backend
 
 # Define plugin identity
-PLUGIN_NAME = "gleann-docs"
+PLUGIN_NAME = "gleann-plugin-docs"
 PLUGIN_URL = "http://localhost:8765"
 CAPABILITIES = ["document-extraction"]
 SUPPORTED_EXTENSIONS = [
@@ -17,12 +19,22 @@ SUPPORTED_EXTENSIONS = [
     ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".csv"
 ]
 
-app = FastAPI(title="Gleann Document Parser Plugin (MarkItDown)")
+logger = logging.getLogger("gleann-plugin-docs")
+
+app = FastAPI(title="Gleann Document Parser Plugin")
 md = MarkItDown()
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "plugin": PLUGIN_NAME, "capabilities": CAPABILITIES}
+    return {
+        "status": "ok",
+        "plugin": PLUGIN_NAME,
+        "capabilities": CAPABILITIES,
+        "backends": {
+            "markitdown": True,
+            "docling": docling_backend.is_available(),
+        },
+    }
 
 @app.post("/convert")
 async def convert_document(file: UploadFile = File(...)):
@@ -34,19 +46,25 @@ async def convert_document(file: UploadFile = File(...)):
     if ext not in SUPPORTED_EXTENSIONS:
         return JSONResponse(status_code=400, content={"error": f"Unsupported extension: {ext}"})
 
-    # Create a temporary file to feed into markitdown
+    # Create a temporary file to feed into the conversion backend
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         content = await file.read()
         tmp.write(content)
         tmp.close()
-        
-        # Parse the document using MarkItDown
+
+        # Smart routing: PDF → Docling (if available), everything else → MarkItDown
+        if ext == ".pdf" and docling_backend.is_available():
+            try:
+                markdown = docling_backend.convert_pdf(tmp.name)
+                os.unlink(tmp.name)
+                return {"markdown": markdown}
+            except Exception as e:
+                logger.warning("Docling failed, falling back to MarkItDown: %s", e)
+
+        # Default: MarkItDown (also serves as fallback if Docling fails)
         result = md.convert(tmp.name)
-        
-        # Cleanup
         os.unlink(tmp.name)
-        
         return {"markdown": result.text_content}
     except Exception as e:
         if 'tmp' in locals() and os.path.exists(tmp.name):
@@ -72,14 +90,20 @@ def install_plugin():
             print(f"Error reading {plugins_file}: {e}")
             registry = {"plugins": []}
     
-    # Remove old entry if exists (update)
-    registry["plugins"] = [p for p in registry.get("plugins", []) if p.get("name") != PLUGIN_NAME]
+    # Remove old entry if exists (update).
+    # Also remove legacy "gleann-docs" entries and any plugin on the same port to avoid conflicts.
+    old_names = {PLUGIN_NAME, "gleann-docs"}
+    registry["plugins"] = [
+        p for p in registry.get("plugins", [])
+        if p.get("name") not in old_names and p.get("url") != PLUGIN_URL
+    ]
     
     # Add our plugin
     plugin_entry = {
         "name": PLUGIN_NAME,
         "url": PLUGIN_URL,
-        "command": [sys.executable, os.path.abspath(__file__), "--serve", "--port", str(args.port)],
+        "command": [sys.executable, os.path.abspath(__file__), "--serve", "--port", str(args.port)]
+                   + (["--no-docling"] if args.no_docling else []),
         "capabilities": CAPABILITIES,
         "extensions": SUPPORTED_EXTENSIONS
     }
@@ -101,7 +125,11 @@ if __name__ == "__main__":
     parser.add_argument("--install", action="store_true", help="Register this plugin with Gleann")
     parser.add_argument("--serve", action="store_true", help="Start the FastAPI server")
     parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765)")
+    parser.add_argument("--no-docling", action="store_true", help="Disable Docling backend, always use MarkItDown")
     args = parser.parse_args()
+
+    if args.no_docling:
+        os.environ["DOCLING_ENABLED"] = "false"
 
     if args.install:
         install_plugin()
