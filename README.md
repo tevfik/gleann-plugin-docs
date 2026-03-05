@@ -1,70 +1,107 @@
-# Gleann-Plugin-Docs
+# gleann-plugin-docs
 
-This is a standalone Python HTTP service that acts as a **Plugin** for [Gleann](https://github.com/tevfik/gleann). It parses and extracts text from complex document formats (PDF, DOCX, XLSX, etc.) so that Gleann can index them into its RAG system.
+Document extraction plugin for [gleann](https://github.com/tevfik/gleann). Converts PDF, DOCX, XLSX, PPTX and other binary document formats into **graph-ready** structured data that gleann ingests directly into KuzuDB + HNSW.
 
-**Backends:**
-- **MarkItDown** (default) — Microsoft's fast document-to-markdown converter. Handles all supported formats.
-- **Docling** (optional) — IBM's AI-powered document understanding. Provides superior PDF processing with table extraction (%97.9 accuracy), OCR, and layout analysis.
+## How It Works
+
+The plugin acts as a **document structure expert** — like the AST code indexer understands code symbols and call relationships, gleann-plugin-docs understands document structure: titles, sections, subsections, and their hierarchy.
+
+```
+                 Plugin                          gleann
+   ┌──────────────────────────────┐    ┌───────────────────────────┐
+   │  PDF/DOCX/XLSX/...          │    │                           │
+   │       ↓                     │    │  nodes + edges            │
+   │  MarkItDown / Docling       │    │       ↓                   │
+   │       ↓                     │    │  KuzuDB (Document Graph)  │
+   │  section_parser.py          │    │                           │
+   │       ↓                     │    │  section content          │
+   │  { nodes, edges }      ────────→│       ↓                   │
+   │                             │    │  MarkdownChunker          │
+   └──────────────────────────────┘    │       ↓                   │
+                                       │  HNSW (Vector Index)     │
+                                       └───────────────────────────┘
+```
+
+**Plugin response (`POST /convert`):**
+```json
+{
+  "nodes": [
+    {"_type": "Document", "path": "report.pdf", "title": "Q4 Report", "format": "pdf", ...},
+    {"_type": "Section", "id": "doc:report.pdf:s0", "heading": "Introduction", "level": 1, "content": "...", ...},
+    {"_type": "Section", "id": "doc:report.pdf:s0.0", "heading": "Background", "level": 2, "content": "...", ...}
+  ],
+  "edges": [
+    {"_type": "HAS_SECTION", "from": "report.pdf", "to": "doc:report.pdf:s0"},
+    {"_type": "HAS_SUBSECTION", "from": "doc:report.pdf:s0", "to": "doc:report.pdf:s0.0"}
+  ]
+}
+```
 
 ## Supported Formats
-`.pdf`, `.docx`, `.doc`, `.xlsx`, `.xls`, `.pptx`, `.ppt`, `.png`, `.jpg`, `.jpeg`, `.csv`
+
+`.pdf` `.docx` `.doc` `.xlsx` `.xls` `.pptx` `.ppt` `.png` `.jpg` `.jpeg` `.csv`
 
 ## Installation
 
-1. Make sure you have Python 3.10+ installed.
-2. Clone this repository to its permanent location and install dependencies:
+**Requirements:** Python 3.10+
+
 ```bash
+# 1. Clone and set up
+git clone <this-repo> ~/.gleann/plugins/gleann-docs
+cd ~/.gleann/plugins/gleann-docs
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Optional: Install Docling for high-quality PDF processing
+# 2. Register with gleann
+python main.py --install
+
+# Done! gleann will auto-start the plugin when needed.
+```
+
+**Optional — high-quality PDF processing with Docling:**
+```bash
 pip install -r requirements-docling.txt
 ```
 
-3. **Register the Plugin with Gleann:**
+> **Note:** After `--install`, **do not move this folder** — gleann saves the absolute path to auto-start the plugin. If you relocate it, run `python main.py --install` again.
+
+## Usage
+
+No manual server management needed. When `gleann build` encounters a PDF/DOCX/etc., it:
+
+1. Checks if the plugin is running (`:8765/health`)
+2. If not, auto-starts it using the registered command
+3. Sends the file → receives graph-ready nodes/edges
+4. Writes `Document` + `Section` nodes to KuzuDB (with `--graph`)
+5. Chunks section content via `MarkdownChunker` → embeds to HNSW
+
 ```bash
-python main.py --install
+# Index a directory with PDFs
+gleann build myindex ./docs --graph
+
+# The plugin starts automatically — no manual intervention
 ```
-*This command updates `~/.gleann/plugins.json` and tells Gleann that this plugin exists, and importantly, registers its exact installation path (the `Command` instruction).*
 
-> [!WARNING]
-> Because `--install` saves the absolute paths of your current Python virtual environment and the `main.py` script, **you should not move or rename this folder after installing**. If you decide to move it, you must run `python main.py --install` again from the new location to update the paths in Gleann's registry.
+**Manual server (for debugging):**
+```bash
+python main.py --serve --port 8765
+```
 
-## How it works
+## Backends
 
-Because `gleann-plugin-docs` registers its execution command during the `--install` step, **you do not need to keep it running.** 
-
-When you run `gleann build` on a directory containing PDFs or Word documents, Gleann will try to reach the plugin's port. If it is offline, Gleann will **automatically spawn the Python process in the background** and route the document through it seamlessly!
-
-*(Note: If you want to run the server manually for debugging, you can use `python main.py --serve`)*
-
-## Docling (Advanced PDF Processing)
-
-When Docling is installed, PDF files are automatically routed to Docling for higher-quality extraction. All other formats continue to use MarkItDown. If Docling fails on a particular PDF, it falls back to MarkItDown automatically.
-
-**Smart Routing:**
 | Format | Backend |
-|---|---|
+|--------|---------|
 | `.pdf` | Docling (if installed) → fallback MarkItDown |
-| `.docx`, `.xlsx`, `.pptx`, etc. | MarkItDown |
-| `.png`, `.jpg`, `.csv` | MarkItDown |
+| Everything else | MarkItDown |
 
 **Disabling Docling:**
-
-If Docling is installed but you want to use only MarkItDown, register the plugin with `--no-docling`:
 ```bash
-# Register without Docling (gleann will always use MarkItDown for PDFs)
-python main.py --install --no-docling
-
-# Re-enable Docling later
-python main.py --install
+python main.py --install --no-docling   # permanent
+DOCLING_ENABLED=false python main.py    # one-time
 ```
 
-The `--no-docling` flag is saved into the plugin's auto-start command in `~/.gleann/plugins.json`, so it persists across `gleann build` runs. You can also set the `DOCLING_ENABLED=false` environment variable for manual runs.
+**Performance:**
+- MarkItDown: ~0.01s/page (fast, good enough for most documents)
+- Docling: ~3.1s/page on CPU (better tables, OCR, layout analysis; 4-8 GB RAM)
 
-**Performance Notes:**
-- Docling uses ~3.1s/page on CPU (vs MarkItDown's ~0.01s/page)
-- First request takes extra ~2-3s for model initialization
-- Requires 4-8 GB RAM when processing PDFs
-- No GPU required (CPU-only is fully supported)

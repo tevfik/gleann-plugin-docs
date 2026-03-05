@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from markitdown import MarkItDown
 import docling_backend
+import section_parser
 
 # Define plugin identity
 PLUGIN_NAME = "gleann-plugin-docs"
@@ -39,14 +40,27 @@ def health():
 @app.post("/convert")
 async def convert_document(file: UploadFile = File(...)):
     """
-    Accepts a multipart file upload, saves it temporarily, 
-    and passes it through MarkItDown to extract text.
+    Accepts a multipart file upload, converts it to markdown, then
+    returns graph-ready nodes and edges (like the AST code indexer).
+
+    Response format:
+    {
+      "nodes": [
+        {"_type": "Document", "path": "...", "title": "...", ...},
+        {"_type": "Section", "id": "doc:...:s0", "heading": "...", "content": "...", ...},
+        ...
+      ],
+      "edges": [
+        {"_type": "HAS_SECTION", "from": "...", "to": "..."},
+        {"_type": "HAS_SUBSECTION", "from": "...", "to": "..."},
+        ...
+      ]
+    }
     """
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in SUPPORTED_EXTENSIONS:
         return JSONResponse(status_code=400, content={"error": f"Unsupported extension: {ext}"})
 
-    # Create a temporary file to feed into the conversion backend
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         content = await file.read()
@@ -54,18 +68,27 @@ async def convert_document(file: UploadFile = File(...)):
         tmp.close()
 
         # Smart routing: PDF → Docling (if available), everything else → MarkItDown
+        markdown = None
         if ext == ".pdf" and docling_backend.is_available():
             try:
                 markdown = docling_backend.convert_pdf(tmp.name)
-                os.unlink(tmp.name)
-                return {"markdown": markdown}
             except Exception as e:
                 logger.warning("Docling failed, falling back to MarkItDown: %s", e)
 
-        # Default: MarkItDown (also serves as fallback if Docling fails)
-        result = md.convert(tmp.name)
+        if markdown is None:
+            result = md.convert(tmp.name)
+            markdown = result.text_content
+
         os.unlink(tmp.name)
-        return {"markdown": result.text_content}
+
+        # Parse into graph-ready structure
+        graph = section_parser.parse_document(
+            markdown,
+            source_path=file.filename,
+            doc_format=ext.lstrip("."),
+        )
+        return graph.to_dict()
+
     except Exception as e:
         if 'tmp' in locals() and os.path.exists(tmp.name):
             os.unlink(tmp.name)
