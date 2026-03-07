@@ -31,6 +31,7 @@ def health():
         "status": "ok",
         "plugin": PLUGIN_NAME,
         "capabilities": CAPABILITIES,
+        "timeout": 120,
         "backends": {
             "markitdown": True,
             "docling": docling_backend.is_available(),
@@ -128,7 +129,8 @@ def install_plugin():
         "command": [sys.executable, os.path.abspath(__file__), "--serve", "--port", str(args.port)]
                    + (["--no-docling"] if args.no_docling else []),
         "capabilities": CAPABILITIES,
-        "extensions": SUPPORTED_EXTENSIONS
+        "extensions": SUPPORTED_EXTENSIONS,
+        "timeout": 120,
     }
     registry["plugins"].append(plugin_entry)
     
