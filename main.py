@@ -31,7 +31,6 @@ def health():
         "status": "ok",
         "plugin": PLUGIN_NAME,
         "capabilities": CAPABILITIES,
-        "timeout": 120,
         "backends": {
             "markitdown": True,
             "docling": docling_backend.is_available(),
@@ -41,55 +40,65 @@ def health():
 @app.post("/convert")
 async def convert_document(file: UploadFile = File(...)):
     """
-    Accepts a multipart file upload, converts it to markdown, then
-    returns graph-ready nodes and edges (like the AST code indexer).
+    Accepts a multipart file upload, extracts text via the best backend,
+    then parses the markdown structure into graph-ready nodes and edges.
 
-    Response format:
-    {
-      "nodes": [
-        {"_type": "Document", "path": "...", "title": "...", ...},
-        {"_type": "Section", "id": "doc:...:s0", "heading": "...", "content": "...", ...},
-        ...
-      ],
-      "edges": [
-        {"_type": "HAS_SECTION", "from": "...", "to": "..."},
-        {"_type": "HAS_SUBSECTION", "from": "...", "to": "..."},
-        ...
-      ]
-    }
+    Returns JSON with:
+      - nodes: List of graph nodes (Document + Section) for KuzuDB
+      - edges: List of graph edges (HAS_SECTION, HAS_SUBSECTION) for KuzuDB
+      - markdown: Raw markdown content (fallback for vector chunking)
+      - backend: Which backend was used ("docling" or "markitdown")
     """
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in SUPPORTED_EXTENSIONS:
         return JSONResponse(status_code=400, content={"error": f"Unsupported extension: {ext}"})
 
+    # Create a temporary file to feed into the conversion backend
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         content = await file.read()
         tmp.write(content)
         tmp.close()
 
+        markdown = ""
+        backend_name = "markitdown"
+        page_count = None
+
         # Smart routing: PDF → Docling (if available), everything else → MarkItDown
-        markdown = None
         if ext == ".pdf" and docling_backend.is_available():
             try:
-                markdown = docling_backend.convert_pdf(tmp.name)
+                result = docling_backend.convert_pdf(tmp.name, linkify=True)
+                markdown = result["markdown"]
+                backend_name = "docling"
+                meta = result.get("meta", {})
+                page_count = meta.get("pages")
             except Exception as e:
                 logger.warning("Docling failed, falling back to MarkItDown: %s", e)
 
-        if markdown is None:
+        # Fallback: MarkItDown
+        if not markdown:
             result = md.convert(tmp.name)
             markdown = result.text_content
+            markdown = docling_backend.linkify_urls(markdown)
+            backend_name = "markitdown"
 
         os.unlink(tmp.name)
 
-        # Parse into graph-ready structure
-        graph = section_parser.parse_document(
-            markdown,
+        # Parse markdown structure into graph-ready nodes and edges
+        doc_format = ext.lstrip(".")
+        parsed = section_parser.parse_document(
+            markdown=markdown,
             source_path=file.filename,
-            doc_format=ext.lstrip("."),
+            doc_format=doc_format,
+            page_count=page_count,
         )
-        return graph.to_dict()
+        response = parsed.to_dict()
 
+        # Also include raw markdown for fallback vector chunking
+        response["markdown"] = markdown
+        response["backend"] = backend_name
+
+        return response
     except Exception as e:
         if 'tmp' in locals() and os.path.exists(tmp.name):
             os.unlink(tmp.name)
@@ -129,8 +138,7 @@ def install_plugin():
         "command": [sys.executable, os.path.abspath(__file__), "--serve", "--port", str(args.port)]
                    + (["--no-docling"] if args.no_docling else []),
         "capabilities": CAPABILITIES,
-        "extensions": SUPPORTED_EXTENSIONS,
-        "timeout": 120,
+        "extensions": SUPPORTED_EXTENSIONS
     }
     registry["plugins"].append(plugin_entry)
     

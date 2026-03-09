@@ -16,6 +16,12 @@ from dataclasses import dataclass, field
 # Heading pattern: # Title, ## Title, ### Title, etc.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
+# Numbered heading pattern: "3.14.1 Title" — dots indicate hierarchy depth.
+_NUMBERED_RE = re.compile(r"^(\d+(?:\.\d+)*)\s+")
+
+# Figure/Table heading pattern: "Figure 4. Multi-AHB matrix"
+_FIGURE_TABLE_RE = re.compile(r"^(Figure|Table)\s+\d+", re.IGNORECASE)
+
 
 @dataclass
 class Node:
@@ -68,6 +74,12 @@ def parse_document(
       - Edges: HAS_SECTION (Document→root), HAS_SUBSECTION (parent→child)
 
     Each Section node carries its raw ``content`` text — gleann handles chunking.
+
+    Hierarchy detection:
+      1. Uses markdown heading levels (#, ##, ###) as primary signal
+      2. If all headings are the same level (e.g. all ##), falls back to
+         numbered heading patterns (1, 2.1, 3.14.1) to infer hierarchy
+      3. Figure/Table headings are attached to their nearest preceding section
     """
     lines = markdown.split("\n")
     nodes: list[Node] = []
@@ -79,6 +91,13 @@ def parse_document(
         m = _HEADING_RE.match(line)
         if m:
             headings.append((i, len(m.group(1)), m.group(2).strip()))
+
+    # --- Detect flat heading syndrome (all same level from docling) ---
+    if headings:
+        levels = set(h[1] for h in headings)
+        if len(levels) == 1:
+            # All headings are the same markdown level — use numbering to infer hierarchy
+            headings = _infer_levels_from_numbering(headings)
 
     # --- Document node ---
     doc_title = _infer_title(markdown, headings)
@@ -201,9 +220,43 @@ def _extract_summary(text: str, max_chars: int = 200) -> str:
     """First non-empty, non-heading paragraph."""
     for para in text.split("\n\n"):
         para = para.strip()
-        if para and not para.startswith("#"):
+        if para and not para.startswith("#") and not para.startswith("<!--"):
             if len(para) > max_chars:
                 cut = para[:max_chars].rsplit(" ", 1)[0]
                 return cut + "..."
             return para
     return ""
+
+
+def _infer_levels_from_numbering(
+    headings: list[tuple[int, int, str]],
+) -> list[tuple[int, int, str]]:
+    """Re-assign heading levels based on numbering patterns.
+
+    When docling outputs all headings as ## (level 2), this function detects
+    numbered headings like "3.14.1 Title" and assigns level = dot count + 1:
+      - "1 Introduction"        → level 1
+      - "2.1 Compatibility"     → level 2
+      - "3.14.1 Internal reset" → level 3
+      - "Figure 4. ..."         → level of previous section + 1
+      - Unnumbered headings     → level 1 (top-level)
+    """
+    result = []
+    prev_level = 1
+
+    for line_idx, _orig_level, title in headings:
+        m = _NUMBERED_RE.match(title)
+        if m:
+            num_str = m.group(1)  # e.g. "3.14.1"
+            level = num_str.count(".") + 1
+            prev_level = level
+            result.append((line_idx, level, title))
+        elif _FIGURE_TABLE_RE.match(title):
+            # Figures/Tables belong to the current section
+            result.append((line_idx, prev_level + 1, title))
+        else:
+            # Unnumbered heading (e.g. "Contents", "Features") — treat as top-level
+            result.append((line_idx, 1, title))
+            prev_level = 1
+
+    return result
