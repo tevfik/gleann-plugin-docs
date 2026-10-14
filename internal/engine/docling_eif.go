@@ -278,26 +278,57 @@ func resolveModelPaths(modelPath, tokenizerPath string) (string, string) {
 		}
 	}
 
-	candidates := []string{
-		os.Getenv("GLEANN_DOCLING_MODEL"),
-		"/tmp/hf_test_model/granite_docling_bitnet_dense.eifm",
-		filepath.Join(os.Getenv("HOME"), ".gleann", "models", "granite-docling", "granite_docling_bitnet_dense.eifm"),
-		"artifacts/granite_docling/granite_docling_bitnet_dense.eifm",
-		"../../gleann/ext/eif-runtime/artifacts/granite_docling/granite_docling_bitnet_dense.eifm",
+	execPath, _ := os.Executable()
+	execDir := filepath.Dir(execPath)
+
+	candidateDirs := []string{
+		execDir,
+		filepath.Join(execDir, "models"),
+		filepath.Join(os.Getenv("HOME"), ".gleann", "models", "granite-docling"),
+		filepath.Join(os.Getenv("HOME"), ".gleann", "models"),
+		"/tmp/hf_test_model",
+		"artifacts/granite_docling",
+		"../../gleann/ext/eif-runtime/artifacts/granite_docling",
 	}
 
-	for _, cand := range candidates {
-		if cand == "" {
-			continue
-		}
-		if _, err := os.Stat(cand); err == nil {
-			tokCand := filepath.Join(filepath.Dir(cand), "tokenizer.bin")
+	if env := os.Getenv("GLEANN_DOCLING_MODEL"); env != "" {
+		if _, err := os.Stat(env); err == nil {
+			tokCand := filepath.Join(filepath.Dir(env), "tokenizer.bin")
 			if tokenizerPath == "" {
 				if _, err := os.Stat(tokCand); err == nil {
 					tokenizerPath = tokCand
 				}
 			}
-			return cand, tokenizerPath
+			return env, tokenizerPath
+		}
+		candidateDirs = append([]string{filepath.Dir(env)}, candidateDirs...)
+	}
+
+	for _, dir := range candidateDirs {
+		if dir == "" {
+			continue
+		}
+		// Check exact name first
+		exact := filepath.Join(dir, "granite_docling_bitnet_dense.eifm")
+		if _, err := os.Stat(exact); err == nil {
+			tokCand := filepath.Join(dir, "tokenizer.bin")
+			if tokenizerPath == "" {
+				if _, err := os.Stat(tokCand); err == nil {
+					tokenizerPath = tokCand
+				}
+			}
+			return exact, tokenizerPath
+		}
+		// Check glob with date suffix e.g. granite_docling_bitnet_dense-*.eifm
+		if matches, _ := filepath.Glob(filepath.Join(dir, "granite_docling_bitnet_dense*.eifm")); len(matches) > 0 {
+			match := matches[len(matches)-1] // latest match
+			tokCand := filepath.Join(dir, "tokenizer.bin")
+			if tokenizerPath == "" {
+				if _, err := os.Stat(tokCand); err == nil {
+					tokenizerPath = tokCand
+				}
+			}
+			return match, tokenizerPath
 		}
 	}
 
