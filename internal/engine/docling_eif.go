@@ -153,6 +153,18 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 			return "", 0, err
 		}
 		return md, 1, nil
+	case ".pptx":
+		md, pages, err := ExtractPPTX(filePath)
+		if err != nil {
+			return "", 0, err
+		}
+		return md, pages, nil
+	case ".xlsx":
+		md, sheets, err := ExtractXLSX(filePath)
+		if err != nil {
+			return "", 0, err
+		}
+		return md, sheets, nil
 	}
 
 	// Images: PNG, JPG, JPEG

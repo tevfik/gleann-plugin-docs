@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/tevfik/gleann-plugin-docs/internal/engine"
@@ -23,7 +24,6 @@ func main() {
 	tokenizerFlag := flag.String("tokenizer", "", "Path to tokenizer.bin")
 	installFlag := flag.Bool("install", false, "Register plugin into ~/.gleann/plugins.json")
 	versionFlag := flag.Bool("version", false, "Show plugin version and exit")
-	jsonFlag := flag.Bool("json", false, "Output parsed JSON structure during CLI convert")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "gleann-plugin-docs: High-performance Go/C Document Intelligence Plugin\n\n")
@@ -52,25 +52,69 @@ func main() {
 		return
 	}
 
-	// CLI convert subcommand
-	args := flag.Args()
-	if len(args) > 0 && args[0] == "convert" {
-		if len(args) < 2 {
-			log.Fatalf("Usage: gleann-plugin-docs convert <file>")
+	// CLI convert subcommand: handle before global flag.Parse to allow flexible flag positioning
+	if len(os.Args) > 1 && os.Args[1] == "convert" {
+		convertFlags := flag.NewFlagSet("convert", flag.ExitOnError)
+		formatFlag := convertFlags.String("format", "markdown", "Output format: markdown, json, text")
+		jsonBoolFlag := convertFlags.Bool("json", false, "Output parsed JSON structure (alias for --format json)")
+		cModelFlag := convertFlags.String("model", "", "Path to granite_docling_bitnet_dense.eifm")
+		cTokenizerFlag := convertFlags.String("tokenizer", "", "Path to tokenizer.bin")
+
+		convertFlags.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage: gleann-plugin-docs convert <document-path> [--format json|markdown] [--model path.eifm]\n")
+			convertFlags.PrintDefaults()
 		}
-		filePath := args[1]
-		eng, err := engine.NewEIFDoclingEngine(*modelFlag, *tokenizerFlag)
+
+		var flagArgs []string
+		var posArgs []string
+		rawArgs := os.Args[2:]
+		for i := 0; i < len(rawArgs); i++ {
+			arg := rawArgs[i]
+			if strings.HasPrefix(arg, "-") {
+				flagArgs = append(flagArgs, arg)
+				if !strings.Contains(arg, "=") && i+1 < len(rawArgs) && !strings.HasPrefix(rawArgs[i+1], "-") {
+					flagName := strings.TrimLeft(arg, "-")
+					if flagName == "format" || flagName == "model" || flagName == "tokenizer" {
+						flagArgs = append(flagArgs, rawArgs[i+1])
+						i++
+					}
+				}
+			} else {
+				posArgs = append(posArgs, arg)
+			}
+		}
+
+		_ = convertFlags.Parse(flagArgs)
+		var filePath string
+		if len(posArgs) > 0 {
+			filePath = posArgs[0]
+		} else {
+			for _, arg := range convertFlags.Args() {
+				if !strings.HasPrefix(arg, "-") && filePath == "" {
+					filePath = arg
+				}
+			}
+		}
+		if filePath == "" {
+			convertFlags.Usage()
+			os.Exit(1)
+		}
+
+		eng, err := engine.NewEIFDoclingEngine(*cModelFlag, *cTokenizerFlag)
 		if err != nil {
-			log.Fatalf("Failed to initialize engine: %v", err)
+			fmt.Fprintf(os.Stderr, "Failed to initialize engine: %v\n", err)
+			os.Exit(1)
 		}
 		defer eng.Close()
 
 		md, pages, err := eng.Convert(context.Background(), filePath)
 		if err != nil {
-			log.Fatalf("Conversion failed: %v", err)
+			fmt.Fprintf(os.Stderr, "Conversion failed: %v\n", err)
+			os.Exit(1)
 		}
 
-		if *jsonFlag {
+		isJSON := *jsonBoolFlag || strings.ToLower(*formatFlag) == "json"
+		if isJSON {
 			ext := filepath.Ext(filePath)
 			parsed := parser.ParseDocument(md, filePath, ext, pages)
 			parsed.Markdown = md
@@ -85,7 +129,8 @@ func main() {
 	}
 
 	// Default or --serve mode: run HTTP server
-	if *serveFlag || len(args) == 0 || (len(args) > 0 && args[0] == "serve") {
+	remaining := flag.Args()
+	if *serveFlag || len(remaining) == 0 || (len(remaining) > 0 && remaining[0] == "serve") {
 		eng, err := engine.NewEIFDoclingEngine(*modelFlag, *tokenizerFlag)
 		if err != nil {
 			log.Printf("[warning] EIF model failed to load (%v). Running text/fallback mode.", err)

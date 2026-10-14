@@ -126,9 +126,10 @@ def install_plugin():
     # Remove old entry if exists (update).
     # Also remove legacy "gleann-docs" entries and any plugin on the same port to avoid conflicts.
     old_names = {PLUGIN_NAME, "gleann-docs"}
+    plugins_list = registry.get("plugins") or []
     registry["plugins"] = [
-        p for p in registry.get("plugins", [])
-        if p.get("name") not in old_names and p.get("url") != PLUGIN_URL
+        p for p in plugins_list
+        if isinstance(p, dict) and p.get("name") not in old_names and p.get("url") != PLUGIN_URL
     ]
     
     # Add our plugin
@@ -155,6 +156,7 @@ def install_plugin():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gleann Document Parser Plugin")
+    parser.add_argument("--name", type=str, default=PLUGIN_NAME, help="Plugin name for registration")
     parser.add_argument("--install", action="store_true", help="Register this plugin with Gleann")
     parser.add_argument("--serve", action="store_true", help="Start the FastAPI server")
     parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765)")
