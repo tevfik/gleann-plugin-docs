@@ -49,6 +49,7 @@ func TestEIFDoclingEngine_TextAndCSV(t *testing.T) {
 }
 
 func TestEIFDoclingEngine_LiveInference(t *testing.T) {
+	t.Setenv("GLEANN_DOCLING_VLM", "1")
 	modelPath, tokPath := resolveModelPaths("", "")
 	if modelPath == "" {
 		t.Skip("skipping live inference test: model not found")

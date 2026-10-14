@@ -10,7 +10,28 @@ var (
 	locRegex      = regexp.MustCompile(`<loc_[0-9]+>|<loc_[^>]+>|<locate="[^"]*">|<locate=[0-9]+>|</locate>`)
 	extraSpaceRe  = regexp.MustCompile(`\n{3,}`)
 	trailingSpace = regexp.MustCompile(`[ \t]+\n`)
+	// Lower-case snake_case tag names only, so text such as "a<b" or "<5" survives.
+	leftoverTagRe = regexp.MustCompile(`</?[a-z][a-z_0-9]*>`)
 )
+
+// dedupeAdjacentBlocks removes blank-line separated blocks that repeat the
+// previous block verbatim, a common artefact of greedy VLM decoding.
+func dedupeAdjacentBlocks(s string) string {
+	blocks := strings.Split(s, "\n\n")
+	out := blocks[:0]
+	prev := ""
+	for _, b := range blocks {
+		t := strings.TrimSpace(b)
+		if t != "" && t == prev {
+			continue
+		}
+		if t != "" {
+			prev = t
+		}
+		out = append(out, b)
+	}
+	return strings.Join(out, "\n\n")
+}
 
 // DocTagsToMarkdown converts IBM Docling DocTags XML into clean Markdown.
 func DocTagsToMarkdown(doctags string) string {
@@ -35,7 +56,12 @@ func DocTagsToMarkdown(doctags string) string {
 	// 4. Process headings and blocks
 	cleaned = convertHeadingsAndBlocks(cleaned)
 
-	// 5. Final clean up
+	// 5. Drop tags the model left unclosed or that have no Markdown form
+	// (<page_header>, a dangling "<text>" when generation stopped early, ...)
+	cleaned = leftoverTagRe.ReplaceAllString(cleaned, "")
+	cleaned = dedupeAdjacentBlocks(cleaned)
+
+	// 6. Final clean up
 	cleaned = trailingSpace.ReplaceAllString(cleaned, "\n")
 	cleaned = extraSpaceRe.ReplaceAllString(cleaned, "\n\n")
 	return strings.TrimSpace(cleaned)

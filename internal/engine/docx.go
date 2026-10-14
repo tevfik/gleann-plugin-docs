@@ -5,6 +5,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -16,15 +18,25 @@ func ExtractDocx(filePath string) (string, error) {
 	}
 	defer r.Close()
 
-	var docFile *zip.File
+	var docFile, stylesFile *zip.File
 	for _, f := range r.File {
-		if f.Name == "word/document.xml" {
+		switch f.Name {
+		case "word/document.xml":
 			docFile = f
-			break
+		case "word/styles.xml":
+			stylesFile = f
 		}
 	}
 	if docFile == nil {
 		return "", fmt.Errorf("word/document.xml not found in %s", filePath)
+	}
+
+	var styles map[string]int
+	if stylesFile != nil {
+		if rc, err := stylesFile.Open(); err == nil {
+			styles = parseHeadingStyles(rc)
+			rc.Close()
+		}
 	}
 
 	rc, err := docFile.Open()
@@ -33,18 +45,157 @@ func ExtractDocx(filePath string) (string, error) {
 	}
 	defer rc.Close()
 
-	return parseDocumentXML(rc)
+	return parseDocumentXMLWithStyles(rc, styles)
 }
 
 func parseDocumentXML(r io.Reader) (string, error) {
+	return parseDocumentXMLWithStyles(r, nil)
+}
+
+var (
+	headingNameRe = regexp.MustCompile(`^(?:heading|başlık|baslik)\s*(\d)$`)
+	// Localized style ids look like "Heading1" / "Balk1" (Turkish "Başlık 1").
+	headingIDRe = regexp.MustCompile(`(?i)^(?:heading|balk|başlık|baslik)(\d)$`)
+)
+
+// headingLevelFromName maps a style name to a Markdown heading level. Word
+// stores localized style ids ("Balk1") but the style *name* in styles.xml stays
+// in the canonical form ("heading 1").
+func headingLevelFromName(name string) int {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if m := headingNameRe.FindStringSubmatch(n); m != nil {
+		if lvl, _ := strconv.Atoi(m[1]); lvl >= 1 && lvl <= 6 {
+			return lvl
+		}
+	}
+	if n == "title" {
+		return 1
+	}
+	return 0
+}
+
+// parseHeadingStyles returns styleId -> heading level (1..6) from styles.xml.
+func parseHeadingStyles(r io.Reader) map[string]int {
+	out := map[string]int{}
+	dec := xml.NewDecoder(r)
+	var curID string
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch e := tok.(type) {
+		case xml.StartElement:
+			switch e.Name.Local {
+			case "style":
+				curID = ""
+				for _, a := range e.Attr {
+					if a.Name.Local == "styleId" {
+						curID = a.Value
+					}
+				}
+			case "name":
+				if curID == "" {
+					continue
+				}
+				for _, a := range e.Attr {
+					if a.Name.Local == "val" {
+						if lvl := headingLevelFromName(a.Value); lvl > 0 {
+							out[curID] = lvl
+						}
+					}
+				}
+			}
+		case xml.EndElement:
+			if e.Name.Local == "style" {
+				curID = ""
+			}
+		}
+	}
+	return out
+}
+
+type docxPara struct {
+	text    strings.Builder
+	heading int
+	list    bool
+	listLvl int
+}
+
+type docxTable struct {
+	rows    [][]string
+	cur     []string
+	cell    []string
+	depth   int
+	inCell  bool
+	maxCols int
+}
+
+func parseDocumentXMLWithStyles(r io.Reader, styles map[string]int) (string, error) {
 	decoder := xml.NewDecoder(r)
 
 	var sb strings.Builder
-	var inTable bool
-	var inCell bool
-	var inHeadingLevel int
-	var currentCellText strings.Builder
-	var currentRowCells []string
+	var paras []*docxPara
+	var tbl *docxTable // outermost table; nested tables are flattened into the cell
+	var inT bool
+	prevWasList := false
+
+	writeBlock := func(s string) {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(s)
+		prevWasList = false
+	}
+
+	emitPara := func(p *docxPara) {
+		text := strings.TrimSpace(p.text.String())
+		if text == "" {
+			return
+		}
+		if tbl != nil && tbl.inCell {
+			tbl.cell = append(tbl.cell, text)
+			return
+		}
+		switch {
+		case p.heading > 0:
+			writeBlock(strings.Repeat("#", p.heading) + " " + text)
+		case p.list:
+			item := strings.Repeat("  ", p.listLvl) + "- " + text
+			if prevWasList {
+				sb.WriteString("\n" + item)
+			} else {
+				writeBlock(item)
+			}
+			prevWasList = true
+		default:
+			writeBlock(text)
+		}
+	}
+
+	flushTable := func(t *docxTable) {
+		if len(t.rows) == 0 {
+			return
+		}
+		var tb strings.Builder
+		for i, row := range t.rows {
+			for len(row) < t.maxCols {
+				row = append(row, "")
+			}
+			tb.WriteString("| " + strings.Join(row, " | ") + " |\n")
+			if i == 0 {
+				tb.WriteString("|" + strings.Repeat(" --- |", t.maxCols) + "\n")
+			}
+		}
+		writeBlock(strings.TrimRight(tb.String(), "\n"))
+	}
+
+	cur := func() *docxPara {
+		if len(paras) == 0 {
+			return nil
+		}
+		return paras[len(paras)-1]
+	}
 
 	for {
 		token, err := decoder.Token()
@@ -57,74 +208,110 @@ func parseDocumentXML(r io.Reader) (string, error) {
 
 		switch elem := token.(type) {
 		case xml.StartElement:
-			name := elem.Name.Local
-			switch name {
+			switch elem.Name.Local {
 			case "tbl":
-				inTable = true
-				sb.WriteString("\n\n")
+				if tbl == nil {
+					tbl = &docxTable{depth: 1}
+				} else {
+					tbl.depth++
+				}
 			case "tr":
-				currentRowCells = nil
+				if tbl != nil && tbl.depth == 1 {
+					tbl.cur = nil
+				}
 			case "tc":
-				inCell = true
-				currentCellText.Reset()
+				if tbl != nil && tbl.depth == 1 {
+					tbl.inCell = true
+					tbl.cell = nil
+				}
+			case "p":
+				paras = append(paras, &docxPara{})
 			case "pStyle":
-				for _, attr := range elem.Attr {
-					if attr.Name.Local == "val" {
-						val := strings.ToLower(attr.Value)
-						if strings.Contains(val, "heading1") || val == "1" {
-							inHeadingLevel = 1
-						} else if strings.Contains(val, "heading2") || val == "2" {
-							inHeadingLevel = 2
-						} else if strings.Contains(val, "heading3") || val == "3" {
-							inHeadingLevel = 3
+				if p := cur(); p != nil {
+					for _, a := range elem.Attr {
+						if a.Name.Local != "val" {
+							continue
+						}
+						if lvl, ok := styles[a.Value]; ok {
+							p.heading = lvl
+						} else if lvl := headingLevelFromName(a.Value); lvl > 0 {
+							p.heading = lvl
+						} else if m := headingIDRe.FindStringSubmatch(a.Value); m != nil {
+							p.heading, _ = strconv.Atoi(m[1])
 						}
 					}
+				}
+			case "outlineLvl":
+				if p := cur(); p != nil && p.heading == 0 {
+					for _, a := range elem.Attr {
+						if a.Name.Local == "val" {
+							if n, err := strconv.Atoi(a.Value); err == nil && n >= 0 && n < 6 {
+								p.heading = n + 1
+							}
+						}
+					}
+				}
+			case "numPr":
+				if p := cur(); p != nil {
+					p.list = true
+				}
+			case "ilvl":
+				if p := cur(); p != nil {
+					for _, a := range elem.Attr {
+						if a.Name.Local == "val" {
+							p.listLvl, _ = strconv.Atoi(a.Value)
+						}
+					}
+				}
+			case "t":
+				inT = true
+			case "tab", "br", "cr":
+				if p := cur(); p != nil {
+					p.text.WriteString(" ")
 				}
 			}
 
 		case xml.EndElement:
-			name := elem.Name.Local
-			switch name {
-			case "tbl":
-				inTable = false
-				sb.WriteString("\n")
-			case "tr":
-				if len(currentRowCells) > 0 {
-					sb.WriteString("| ")
-					sb.WriteString(strings.Join(currentRowCells, " | "))
-					sb.WriteString(" |\n")
-					// If first row in table, add separator
-					if !strings.Contains(sb.String(), " --- |") {
-						sb.WriteString("|")
-						for range currentRowCells {
-							sb.WriteString(" --- |")
-						}
-						sb.WriteString("\n")
-					}
+			switch elem.Name.Local {
+			case "t":
+				inT = false
+			case "p":
+				if len(paras) > 0 {
+					p := paras[len(paras)-1]
+					paras = paras[:len(paras)-1]
+					emitPara(p)
 				}
 			case "tc":
-				inCell = false
-				cellStr := strings.TrimSpace(currentCellText.String())
-				cellStr = strings.ReplaceAll(cellStr, "|", "\\|")
-				currentRowCells = append(currentRowCells, cellStr)
-			case "p":
-				if !inTable {
-					if inHeadingLevel > 0 {
-						prefix := strings.Repeat("#", inHeadingLevel)
-						sb.WriteString(fmt.Sprintf("\n\n%s ", prefix))
-						inHeadingLevel = 0
-					} else {
-						sb.WriteString("\n\n")
+				if tbl != nil && tbl.depth == 1 {
+					cell := strings.Join(tbl.cell, "<br>")
+					cell = strings.ReplaceAll(cell, "|", "\\|")
+					tbl.cur = append(tbl.cur, cell)
+					tbl.inCell = false
+				}
+			case "tr":
+				if tbl != nil && tbl.depth == 1 && len(tbl.cur) > 0 {
+					if len(tbl.cur) > tbl.maxCols {
+						tbl.maxCols = len(tbl.cur)
+					}
+					tbl.rows = append(tbl.rows, tbl.cur)
+				}
+			case "tbl":
+				if tbl != nil {
+					tbl.depth--
+					if tbl.depth == 0 {
+						flushTable(tbl)
+						tbl = nil
 					}
 				}
 			}
 
 		case xml.CharData:
-			text := string(elem)
-			if inCell {
-				currentCellText.WriteString(text)
-			} else {
-				sb.WriteString(text)
+			// Only w:t carries visible text; w:delText (tracked deletions) and
+			// w:instrText (field codes) are separate elements and are ignored.
+			if inT {
+				if p := cur(); p != nil {
+					p.text.Write(elem)
+				}
 			}
 		}
 	}

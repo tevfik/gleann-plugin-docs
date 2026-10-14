@@ -1,11 +1,12 @@
 package engine
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../../gleann/ext/eif-runtime/include -O3
+#cgo CFLAGS: -I${SRCDIR}/../../../../gleann/ext/eif-runtime/include -O3 -fopenmp
 #cgo linux LDFLAGS: ${SRCDIR}/../../../../gleann/ext/eif-runtime/build/libeif_runtime.a -Wl,-Bstatic -lgomp -Wl,-Bdynamic -lpthread -lm
 #cgo darwin LDFLAGS: ${SRCDIR}/../../../../gleann/ext/eif-runtime/build/libeif_runtime.a -lm
 #cgo windows LDFLAGS: ${SRCDIR}/../../../../gleann/ext/eif-runtime/build/libeif_runtime.a -lm
 #include "eif_llm.h"
+#include <omp.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,7 +32,11 @@ static void docling_token_collector(const char *piece, int token_id, void *user_
     b->buf[b->len] = '\0';
 }
 
-static char *c_run_docling_vision(eif_llm_t *llm, const char *image_path, const char *prompt, int max_tokens) {
+static void docling_set_threads(int n) {
+    if (n > 0) omp_set_num_threads(n);
+}
+
+static char *c_run_docling_vision(eif_llm_t *llm, const char *image_path, const char *prompt, int max_tokens, float rep_penalty) {
     if (!llm || !image_path) return NULL;
 
     docling_buf_t b;
@@ -46,7 +51,7 @@ static char *c_run_docling_vision(eif_llm_t *llm, const char *image_path, const 
     cfg.max_new_tokens = max_tokens > 0 ? max_tokens : 1024;
     cfg.temperature = 0.0f; // greedy argmax for OCR
     cfg.top_p = 0.90f;
-    cfg.repetition_penalty = 1.10f;
+    cfg.repetition_penalty = rep_penalty;
     cfg.eos_token_id = -1;
 
     const char *p = prompt ? prompt : "Convert this page to docling.";
@@ -66,10 +71,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 	"unsafe"
 
 	"github.com/tevfik/gleann-plugin-docs/internal/parser"
@@ -92,9 +99,16 @@ func NewEIFDoclingEngine(modelPath, tokenizerPath string) (*EIFDoclingEngine, er
 		tokenizerPath: resolvedTok,
 	}
 
+	if !vlmEnabled() {
+		log.Printf("[docling-eif] VLM disabled (text layer + native Office extractors only); set GLEANN_DOCLING_VLM=1 to enable OCR of scanned pages and images")
+		return eng, nil
+	}
+
 	if resolvedModel == "" {
 		return eng, fmt.Errorf("no docling model found (checked --model, GLEANN_DOCLING_MODEL, and ~/.gleann/models)")
 	}
+
+	configureThreads()
 
 	cModel := C.CString(resolvedModel)
 	defer C.free(unsafe.Pointer(cModel))
@@ -185,12 +199,37 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 	return "", 0, fmt.Errorf("unsupported file extension: %s", ext)
 }
 
+// configureThreads caps the OpenMP team size. The runtime's static scheduling
+// and spin barriers degrade badly when all logical cores are used on a busy or
+// hybrid (P/E core) machine: a 6s page took 270s with 20 threads under load.
+// OMP_NUM_THREADS or GLEANN_DOCLING_THREADS override the default of NumCPU/2.
+func configureThreads() {
+	if os.Getenv("OMP_NUM_THREADS") != "" && os.Getenv("GLEANN_DOCLING_THREADS") == "" {
+		return
+	}
+	n := runtime.NumCPU() / 2
+	if v, err := strconv.Atoi(os.Getenv("GLEANN_DOCLING_THREADS")); err == nil && v > 0 {
+		n = v
+	}
+	if n < 4 {
+		n = 4
+	}
+	C.docling_set_threads(C.int(n))
+}
+
+func repetitionPenalty() float64 {
+	if v, err := strconv.ParseFloat(os.Getenv("GLEANN_DOCLING_REP_PENALTY"), 64); err == nil && v > 0 {
+		return v
+	}
+	return 1.0
+}
+
 func (e *EIFDoclingEngine) convertImage(imagePath string) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if !e.loaded {
-		return "", fmt.Errorf("docling model is not loaded")
+		return "", fmt.Errorf("image/scanned-page conversion needs the VLM, which is disabled or not loaded (set GLEANN_DOCLING_VLM=1)")
 	}
 
 	cImg := C.CString(imagePath)
@@ -199,74 +238,187 @@ func (e *EIFDoclingEngine) convertImage(imagePath string) (string, error) {
 	cPrompt := C.CString("Convert this page to docling.")
 	defer C.free(unsafe.Pointer(cPrompt))
 
-	cRes := C.c_run_docling_vision(&e.llm, cImg, cPrompt, 1024)
+	cRes := C.c_run_docling_vision(&e.llm, cImg, cPrompt, 1024, C.float(repetitionPenalty()))
 	if cRes == nil {
 		return "", fmt.Errorf("vision inference returned null")
 	}
 	defer C.free(unsafe.Pointer(cRes))
 
 	rawDocTags := C.GoString(cRes)
+	if os.Getenv("GLEANN_DOCLING_DEBUG") == "1" {
+		log.Printf("[docling-eif] raw doctags (%d bytes) for %s:\n%s", len(rawDocTags), imagePath, rawDocTags)
+	}
 	markdown := parser.DocTagsToMarkdown(rawDocTags)
 	return markdown, nil
 }
 
+// minPageTextChars is the number of non-space characters a page's text layer
+// needs before the page is considered "digital" and not in need of OCR/VLM.
+const minPageTextChars = 20
+
+// vlmEnabled reports whether the slow Docling VLM may be used. It is opt-in:
+// ~10-17s/page on CPU and unreliable output on Turkish and dense pages, so by
+// default only the text layer and the native Office extractors are used.
+func vlmEnabled() bool {
+	return envTrue("GLEANN_DOCLING_VLM") || envTrue("GLEANN_DOCLING_FORCE_VLM")
+}
+
+func envTrue(name string) bool {
+	switch strings.ToLower(os.Getenv(name)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// pdfPageTexts returns the text layer of every page (pdftotext separates pages
+// with a form feed).
+func pdfPageTexts(ctx context.Context, pdfPath string) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "pdftotext", pdfPath, "-").Output()
+	if err != nil {
+		return nil, err
+	}
+	pages := strings.Split(string(out), "\f")
+	if n := len(pages); n > 1 && strings.TrimSpace(pages[n-1]) == "" {
+		pages = pages[:n-1] // trailing separator after the last page
+	}
+	return pages, nil
+}
+
+func nonSpaceChars(s string) int {
+	n := 0
+	for _, r := range s {
+		if !unicode.IsSpace(r) {
+			n++
+		}
+	}
+	return n
+}
+
+// renderPDFPages rasterizes pages first..last (1-based, 0 = all) and returns the
+// PNG paths in page order plus a cleanup func.
+func renderPDFPages(ctx context.Context, pdfPath string, first, last int) ([]string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "gleann_docling_pdf_*")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	cleanup := func() { os.RemoveAll(tmpDir) }
+
+	args := []string{"-png", "-r", "150"}
+	if first > 0 {
+		args = append(args, "-f", strconv.Itoa(first), "-l", strconv.Itoa(last))
+	}
+	args = append(args, pdfPath, filepath.Join(tmpDir, "page"))
+	if err := exec.CommandContext(ctx, "pdftoppm", args...).Run(); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("pdf rendering failed: %w", err)
+	}
+
+	matches, _ := filepath.Glob(filepath.Join(tmpDir, "page-*.png"))
+	if len(matches) == 0 {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("no page images generated by pdftoppm")
+	}
+	sort.Slice(matches, func(i, j int) bool { return extractPageNumber(matches[i]) < extractPageNumber(matches[j]) })
+	return matches, cleanup, nil
+}
+
+// convertPDF decides per page: pages with a text layer are taken from
+// pdftotext (milliseconds); only pages without one need OCR/VLM. Without the
+// opt-in VLM those pages are skipped with a warning.
 func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (string, int, error) {
-	// Fast path: If PDF has digital text, extract it in milliseconds
-	forceVLM := os.Getenv("GLEANN_DOCLING_FORCE_VLM") == "1"
-	if !forceVLM {
-		txtCmd := exec.CommandContext(ctx, "pdftotext", pdfPath, "-")
-		if out, err := txtCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 100 {
-			text := strings.TrimSpace(string(out))
-			return text, 1, nil
+	force := envTrue("GLEANN_DOCLING_FORCE_VLM")
+
+	pages, err := pdfPageTexts(ctx, pdfPath)
+	if err != nil {
+		log.Printf("[docling-eif] pdftotext failed (%v)", err)
+		pages = nil
+	}
+
+	if pages == nil || force {
+		// No usable text layer information: rasterize everything.
+		return e.convertPDFAllVLM(ctx, pdfPath)
+	}
+
+	result := make([]string, len(pages))
+	var scanned []int // 0-based indexes of pages without text
+	for i, t := range pages {
+		if nonSpaceChars(t) >= minPageTextChars {
+			result[i] = strings.TrimSpace(t)
+		} else {
+			scanned = append(scanned, i)
 		}
 	}
 
-	// Scanned or image-based PDF: Route to Docling VLM
-	tmpDir, err := os.MkdirTemp("", "gleann_docling_pdf_*")
+	if len(scanned) > 0 {
+		e.mu.Lock()
+		loaded := e.loaded
+		e.mu.Unlock()
+		if !loaded {
+			log.Printf("[docling-eif] %s: %d of %d page(s) have no text layer and were skipped (OCR/VLM not enabled; set GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath), len(scanned), len(pages))
+		} else {
+			for _, idx := range scanned {
+				if ctx.Err() != nil {
+					return "", 0, ctx.Err()
+				}
+				imgs, cleanup, err := renderPDFPages(ctx, pdfPath, idx+1, idx+1)
+				if err != nil {
+					log.Printf("[docling-eif] warning: page %d: %v", idx+1, err)
+					continue
+				}
+				md, err := e.convertImage(imgs[0])
+				cleanup()
+				if err != nil {
+					log.Printf("[docling-eif] warning: failed page %d: %v", idx+1, err)
+					continue
+				}
+				result[idx] = md
+			}
+		}
+	}
+
+	var kept []string
+	for _, r := range result {
+		if strings.TrimSpace(r) != "" {
+			kept = append(kept, r)
+		}
+	}
+	if len(kept) == 0 {
+		return "", 0, fmt.Errorf("no extractable text in %s: scanned PDF and OCR/VLM is not enabled (set GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
+	}
+	return strings.Join(kept, "\n\n"), len(pages), nil
+}
+
+func (e *EIFDoclingEngine) convertPDFAllVLM(ctx context.Context, pdfPath string) (string, int, error) {
+	e.mu.Lock()
+	loaded := e.loaded
+	e.mu.Unlock()
+	if !loaded {
+		return "", 0, fmt.Errorf("cannot read %s: no text layer available and the VLM is not enabled (set GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
+	}
+
+	imgs, cleanup, err := renderPDFPages(ctx, pdfPath, 0, 0)
 	if err != nil {
 		return "", 0, err
 	}
-	defer os.RemoveAll(tmpDir)
-
-	pagePrefix := filepath.Join(tmpDir, "page")
-	cmd := exec.CommandContext(ctx, "pdftoppm", "-png", "-r", "150", pdfPath, pagePrefix)
-	if err := cmd.Run(); err != nil {
-		log.Printf("[docling-eif] pdftoppm failed (%v)", err)
-		return "", 0, fmt.Errorf("pdf rendering failed: %w", err)
-	}
-
-	// Find generated page images
-	matches, err := filepath.Glob(filepath.Join(tmpDir, "page-*.png"))
-	if err != nil || len(matches) == 0 {
-		return "", 0, fmt.Errorf("no page images generated by pdftoppm")
-	}
-
-	// Sort pages numerically: page-1.png, page-2.png, ..., page-10.png
-	sort.Slice(matches, func(i, j int) bool {
-		numI := extractPageNumber(matches[i])
-		numJ := extractPageNumber(matches[j])
-		return numI < numJ
-	})
+	defer cleanup()
 
 	var pageMarkdowns []string
-	for _, pageImg := range matches {
+	for _, img := range imgs {
 		if ctx.Err() != nil {
 			return "", 0, ctx.Err()
 		}
-		pageMD, err := e.convertImage(pageImg)
+		md, err := e.convertImage(img)
 		if err != nil {
-			log.Printf("[docling-eif] warning: failed page %s: %v", pageImg, err)
+			log.Printf("[docling-eif] warning: failed page %s: %v", img, err)
 			continue
 		}
-		pageMarkdowns = append(pageMarkdowns, pageMD)
+		pageMarkdowns = append(pageMarkdowns, md)
 	}
-
 	if len(pageMarkdowns) == 0 {
 		return "", 0, fmt.Errorf("no content extracted from pdf pages")
 	}
-
-	joined := strings.Join(pageMarkdowns, "\n\n---\n\n")
-	return joined, len(matches), nil
+	return strings.Join(pageMarkdowns, "\n\n---\n\n"), len(imgs), nil
 }
 
 func extractPageNumber(path string) int {
