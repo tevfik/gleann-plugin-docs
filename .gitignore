@@ -8,6 +8,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Binaries
+bin/
+*.log
+
 # OS generated files
 .DS_Store
 Thumbs.db
