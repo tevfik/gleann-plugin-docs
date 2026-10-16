@@ -51,6 +51,7 @@ type headingInfo struct {
 
 // ParseDocument parses Markdown into graph-ready nodes and edges matching section_parser.py.
 func ParseDocument(markdown, sourcePath, docFormat string, pageCount int) *PluginResult {
+	markdown = LinkifyURLs(markdown)
 	lines := strings.Split(markdown, "\n")
 	var nodes []Node
 	var edges []Edge

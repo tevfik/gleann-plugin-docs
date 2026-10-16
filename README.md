@@ -30,7 +30,8 @@ The plugin acts as a **document structure expert** — like the AST code indexer
 2. **Hybrid PDF Fast-Path**: Searchable digital PDFs extract in **~0.05s** via `pdftotext`, while scanned, image-heavy, or raster pages automatically route through the Docling BitNet VLM.
 3. **Pure Go DOCX/Office Parser**: Fast in-process XML unzipping and paragraph/heading extraction without third-party converters.
 4. **Hierarchical Graph Generation**: Emits `Document` and nested `Section` nodes with `HAS_SECTION` and `HAS_SUBSECTION` edges ready for Gleann's KùzuDB knowledge graph.
-5. **Table-Aware Extraction**: Tables are cleanly extracted in markdown table syntax, preserving tabular data integrity during chunking.
+5. **Table-Aware Extraction**: Tables are cleanly extracted in markdown table syntax, preserving tabular data integrity during chunking. OTSL tables with merged cells (`lcel`, `ucel`, `xcel`) are rendered as HTML tables with `colspan`/`rowspan`.
+6. **Optional ONNX page parser (CPU, ~1–2 s/page)**: layout detection + PaddleOCR through ONNX Runtime for scanned pages and images, including Turkish. Off by default; enable with `GLEANN_DOCLING_ONNX=1`. See [ONNX_BACKEND.md](ONNX_BACKEND.md) for setup, measured accuracy and limits.
 
 ---
 
@@ -131,12 +132,33 @@ Extracts structured hierarchy from a document.
 
 ---
 
-## Running Tests
+## ONNX page parser
 
 ```bash
-# Run unit tests (parser & HTTP server)
+make download-doc-models                                   # ~20 MB, SHA-256 verified
+GLEANN_DOCLING_ONNX=1 ./bin/gleann-plugin-docs convert scan.pdf
+make bench-docparser PDF=paper.pdf PAGES=1-3               # accuracy/latency against the PDF's text layer
+```
+
+Needs `libonnxruntime` (set `GLEANN_ORT_LIB` or place it in `~/.gleann/lib`). Details, results and known
+limits: [ONNX_BACKEND.md](ONNX_BACKEND.md).
+
+## Running Tests & Benchmarks
+
+```bash
+# Run unit tests (parser, HTTP server, ONNX page parser)
 make test
+
+# Benchmark document extraction across the sample corpus (testdata/documents):
+make bench
+
+# Standard Go engine microbenchmarks:
+make bench-engine
+
+# The ONNX integration tests need the models and libonnxruntime; without them they skip
+make download-doc-models
 
 # Run all tests including E2E and VLM integration
 make test-all
 ```
+

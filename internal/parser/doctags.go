@@ -2,6 +2,7 @@ package parser
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -42,16 +43,20 @@ func DocTagsToMarkdown(doctags string) string {
 	// 1. Strip spatial location coordinates
 	cleaned := locRegex.ReplaceAllString(doctags, "")
 
-	// 2. Normalize breaks
+	// 2. Tables first: OTSL ends its rows with <nl>, which the break
+	// normalisation below would turn into plain newlines.
+	// Rendered tables are parked behind placeholders: the clean-up passes
+	// below strip lower-case tags, which would destroy an HTML table.
+	var tables []string
+	cleaned = convertOTSLTables(cleaned, &tables)
+
+	// 3. Normalize breaks
 	cleaned = strings.ReplaceAll(cleaned, "<nl>", "\n")
 	cleaned = strings.ReplaceAll(cleaned, "</nl>", "\n")
 	cleaned = strings.ReplaceAll(cleaned, "<br>", "\n")
 	cleaned = strings.ReplaceAll(cleaned, "</br>", "\n")
 	cleaned = strings.ReplaceAll(cleaned, "<pb>", "\n\n---\n\n")
 	cleaned = strings.ReplaceAll(cleaned, "<page_break>", "\n\n---\n\n")
-
-	// 3. Process tables (OTSL and standard table tags)
-	cleaned = convertOTSLTables(cleaned)
 
 	// 4. Process headings and blocks
 	cleaned = convertHeadingsAndBlocks(cleaned)
@@ -64,10 +69,17 @@ func DocTagsToMarkdown(doctags string) string {
 	// 6. Final clean up
 	cleaned = trailingSpace.ReplaceAllString(cleaned, "\n")
 	cleaned = extraSpaceRe.ReplaceAllString(cleaned, "\n\n")
+	for i, tbl := range tables {
+		cleaned = strings.Replace(cleaned, tablePlaceholder(i), strings.TrimSpace(tbl), 1)
+	}
 	return strings.TrimSpace(cleaned)
 }
 
-func convertOTSLTables(text string) string {
+// tablePlaceholder is the stand-in for the i-th rendered table. The NUL bytes
+// cannot occur in model output and survive every regexp pass below.
+func tablePlaceholder(i int) string { return "\x00TABLE" + strconv.Itoa(i) + "\x00" }
+
+func convertOTSLTables(text string, stash *[]string) string {
 	// Pattern for OTSL or <table> blocks
 	tableRegex := regexp.MustCompile(`(?s)<(?:otsl|table)>(.*?)</(?:otsl|table)>`)
 
@@ -77,6 +89,17 @@ func convertOTSLTables(text string) string {
 		inner = strings.TrimSuffix(inner, "</otsl>")
 		inner = strings.TrimSuffix(inner, "</table>")
 
+		if isOTSL(inner) {
+			grid, caption := parseOTSL(inner)
+			md := renderOTSL(grid, caption)
+			if md == "" {
+				return ""
+			}
+			*stash = append(*stash, md)
+			return "\n\n" + tablePlaceholder(len(*stash)-1) + "\n\n"
+		}
+
+		inner = strings.ReplaceAll(inner, "<nl>", "\n")
 		rows := parseTableRows(inner)
 		if len(rows) == 0 {
 			return ""

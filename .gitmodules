@@ -1,0 +1,3 @@
+[submodule "ext/bitllm.c"]
+	path = ext/bitllm.c
+	url = https://github.com/tevfik/bitllm.c.git

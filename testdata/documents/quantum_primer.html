@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quantum Computing and Information Primer</title>
+</head>
+<body>
+    <h1>Quantum Computing and Information Primer</h1>
+    <p>Quantum computing leverages the principles of <strong>quantum mechanics</strong> to process information in fundamentally new ways. Research updates are posted at https://quantum-journal.org and www.ibm.com/quantum.</p>
+    
+    <h2>1. Mathematical Foundations</h2>
+    <p>A state vector |&psi;&gt; in an N-dimensional Hilbert space is represented as a linear combination of orthonormal basis vectors:</p>
+    <blockquote>
+        |&psi;&gt; = &sum; c_i |i&gt;, where &sum; |c_i|^2 = 1.
+    </blockquote>
+
+    <h2>2. Gate Operations &amp; Complexity</h2>
+    <table>
+        <thead>
+            <tr><th>Gate</th><th>Matrix Representation</th><th>Classical Equivalent</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Hadamard (H)</td><td>1/&radic;2 [[1, 1], [1, -1]]</td><td>None (Random Coin)</td><td>Creates equal superposition</td></tr>
+            <tr><td>Pauli-X</td><td>[[0, 1], [1, 0]]</td><td>NOT Gate</td><td>Bit flip operator</td></tr>
+            <tr><td>Pauli-Z</td><td>[[1, 0], [0, -1]]</td><td>None</td><td>Phase flip operator</td></tr>
+            <tr><td>CNOT</td><td>4x4 Permutation Matrix</td><td>XOR Gate</td><td>Entangles control and target</td></tr>
+        </tbody>
+    </table>
+
+    <h2>3. Error Mitigation Strategies</h2>
+    <p>Zero-noise extrapolation (ZNE) and probabilistic error cancellation (PEC) enable shallow quantum circuit execution on noisy intermediate-scale quantum (NISQ) devices.</p>
+    <ul>
+        <li>Reference implementation: <a href="https://github.com/qiskit/qiskit">Qiskit Repository</a></li>
+        <li>Standards draft: https://standards.ieee.org/project/7130.html</li>
+    </ul>
+</body>
+</html>

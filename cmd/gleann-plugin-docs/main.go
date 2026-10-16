@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
 	"github.com/tevfik/gleann-plugin-docs/internal/engine"
 	"github.com/tevfik/gleann-plugin-docs/internal/httpserver"
 	"github.com/tevfik/gleann-plugin-docs/internal/parser"
@@ -30,6 +31,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --serve [--port 8765] [--model path.eifm]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs convert <document.pdf|png|csv> [--json]\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> [--dir DIR]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --install\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --version\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
@@ -50,6 +52,10 @@ func main() {
 		}
 		fmt.Println("Plugin registered successfully into ~/.gleann/plugins.json")
 		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "models" {
+		os.Exit(runModels(os.Args[2:]))
 	}
 
 	// CLI convert subcommand: handle before global flag.Parse to allow flexible flag positioning
@@ -117,13 +123,12 @@ func main() {
 		if isJSON {
 			ext := filepath.Ext(filePath)
 			parsed := parser.ParseDocument(md, filePath, ext, pages)
-			parsed.Markdown = md
 			parsed.Backend = eng.BackendName()
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(parsed)
 		} else {
-			fmt.Println(md)
+			fmt.Println(parser.LinkifyURLs(md))
 		}
 		return
 	}
@@ -220,4 +225,84 @@ func installPlugin(port int) error {
 		return err
 	}
 	return os.WriteFile(pluginsFile, out, 0644)
+}
+
+// runModels implements `gleann-plugin-docs models <download|verify|list>`: the
+// ONNX models of the hybrid page parser (layout + OCR, ~23 MB in total).
+func runModels(args []string) int {
+	fs := flag.NewFlagSet("models", flag.ContinueOnError)
+	dir := fs.String("dir", docparser.ModelDir(), "model directory (default $GLEANN_DOCPARSER_MODELS or ~/.gleann/models/docparser)")
+	profile := fs.String("profile", "", "OCR model set: latin (default, includes Turkish), chinese, or all")
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs models <download|verify|list> [--dir DIR]")
+		return 2
+	}
+	action := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+
+	specs, err := modelSpecs(*profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+
+	switch action {
+	case "list":
+		for _, m := range specs {
+			status := "missing"
+			if err := docparser.VerifyModel(*dir, m); err == nil {
+				status = "ok"
+			}
+			fmt.Printf("%-8s %-30s %9d bytes  %s\n", m.Name, m.File, m.Size, status)
+		}
+	case "verify":
+		bad := 0
+		for _, m := range specs {
+			if err := docparser.VerifyModel(*dir, m); err != nil {
+				fmt.Printf("FAIL %s: %v\n", m.File, err)
+				bad++
+			} else {
+				fmt.Printf("ok   %s\n", m.File)
+			}
+		}
+		if bad > 0 {
+			return 1
+		}
+	case "download":
+		err := docparser.EnsureModels(context.Background(), *dir, specs, func(s string) { fmt.Println(s) })
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+		fmt.Printf("models are in %s\n", *dir)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown models action %q\n", action)
+		return 2
+	}
+	return 0
+}
+
+// modelSpecs returns the model files of the requested OCR profile: "" selects
+// the default, "all" every profile (shared files listed once).
+func modelSpecs(profile string) ([]docparser.ModelSpec, error) {
+	if strings.EqualFold(profile, "all") {
+		seen := map[string]bool{}
+		var all []docparser.ModelSpec
+		for _, p := range []docparser.OCRProfile{docparser.ProfileLatin, docparser.ProfileChinese} {
+			for _, m := range docparser.DefaultModels(p) {
+				if !seen[m.File] {
+					seen[m.File] = true
+					all = append(all, m)
+				}
+			}
+		}
+		return all, nil
+	}
+	p, err := docparser.ProfileByName(profile)
+	if err != nil {
+		return nil, err
+	}
+	return docparser.DefaultModels(p), nil
 }

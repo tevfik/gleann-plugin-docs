@@ -12,7 +12,18 @@
 
 ---
 
+## Added: ONNX page parser (opt-in)
+
+- [x] **Layout + OCR through ONNX Runtime** (`internal/docparser`): PicoDet layout model, PP-OCRv5 latin / PP-OCRv4 chinese, coverage safety net, XY-cut reading order, OCR-grid table fallback. See `ONNX_BACKEND.md`.
+- [x] **OTSL state machine** with merged cells (`internal/parser/otsl.go`); the old converter dropped `lcel`/`ucel`/`xcel` cells and shifted columns.
+- [x] **Model downloader** (`models download|verify|list`, `make download-doc-models`), `-tags embedmodels` build.
+
 ## Future Roadmap
+
+- [ ] **ONNX backend on ARM64**: not tested yet; run `make bench-docparser` there and decide whether to enable it by default.
+- [ ] **Granite deep path**: measure `GLEANN_DOCLING_ONNX_DEEP=1`; check that the `.eifm` model accepts box-guided prompts.
+- [ ] **Better tables and layout for the ONNX path**: a table-structure model instead of the OCR grid, a layout model that knows references, headers and formulas.
+- [ ] **Turkish ı/İ**: normalise or correct the recogniser's dotted/dotless confusion.
 
 - [ ] **Hardware Acceleration**: Enable Metal (macOS) and CUDA/Vulkan (Linux/Windows) inference backends in `eif-runtime`.
 - [ ] **Streaming Page Conversion**: Stream extracted sections page-by-page over chunked HTTP for very large (1000+ page) documents.

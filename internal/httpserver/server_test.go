@@ -158,3 +158,34 @@ func TestConvertEndpoint_MissingFile(t *testing.T) {
 		t.Fatalf("expected 422 Unprocessable Entity, got %d", w.Code)
 	}
 }
+
+func TestConvertEndpoint_HTML(t *testing.T) {
+	srv := New(&mockEngine{available: true, name: "docling-eif"}, 8765)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "document.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte("<h1>Hello HTML</h1><p>Test paragraph with https://example.com link.</p>"))
+	_ = writer.Close()
+
+	req := httptest.NewRequest("POST", "/convert", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	srv.handleConvert(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res["backend"] != "docling-eif" {
+		t.Errorf("expected docling-eif backend, got %v", res["backend"])
+	}
+}
+

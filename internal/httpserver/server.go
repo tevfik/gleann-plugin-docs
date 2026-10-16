@@ -25,7 +25,8 @@ var (
 	Capabilities = []string{"document-extraction"}
 	SupportedExts = []string{
 		".pdf", ".docx", ".doc", ".xlsx", ".xls",
-		".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".csv", ".txt", ".md",
+		".pptx", ".ppt", ".epub", ".html", ".htm",
+		".png", ".jpg", ".jpeg", ".csv", ".txt", ".md",
 	}
 )
 
@@ -93,7 +94,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"timeout":      120,
 		"backends": map[string]bool{
 			"docling-eif": s.eng != nil && s.eng.IsAvailable(),
-			"markitdown":  false,
+			"bitllm.c":    s.eng != nil && s.eng.IsAvailable(),
+			"markitdown":  true,
 		},
 	})
 }
@@ -163,7 +165,6 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 
 	docFormat := strings.TrimPrefix(ext, ".")
 	parsed := parser.ParseDocument(markdown, header.Filename, docFormat, pageCount)
-	parsed.Markdown = markdown
 	parsed.Backend = s.eng.BackendName()
 
 	w.Header().Set("Content-Type", "application/json")
