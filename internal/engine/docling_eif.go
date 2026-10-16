@@ -1,13 +1,17 @@
 package engine
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../ext/bitllm.c/include -O3 -fopenmp
+#cgo CFLAGS: -I${SRCDIR}/../../ext/bitllm.c/include -O3
+#cgo linux CFLAGS: -fopenmp
+#cgo windows CFLAGS: -fopenmp
 #cgo linux LDFLAGS: ${SRCDIR}/../../ext/bitllm.c/build/libbitllm.a -fopenmp -lpthread -lm
 #cgo darwin LDFLAGS: ${SRCDIR}/../../ext/bitllm.c/build/libbitllm.a -lm
 #cgo windows LDFLAGS: ${SRCDIR}/../../ext/bitllm.c/build/libbitllm.a -lm
 #include "bitllm.h"
 #include "eif_llm.h"
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,7 +38,9 @@ static void docling_token_collector(const char *piece, int token_id, void *user_
 }
 
 static void docling_set_threads(int n) {
+#ifdef _OPENMP
     if (n > 0) omp_set_num_threads(n);
+#endif
 }
 
 static char *c_run_docling_vision(eif_llm_t *llm, const char *image_path, const char *prompt, int max_tokens, float rep_penalty) {
