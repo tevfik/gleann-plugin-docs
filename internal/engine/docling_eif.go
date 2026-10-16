@@ -104,29 +104,39 @@ func NewEIFDoclingEngine(modelPath, tokenizerPath string) (*EIFDoclingEngine, er
 		return eng, nil
 	}
 
-	if resolvedModel == "" {
-		return eng, fmt.Errorf("no docling model found (checked --model, GLEANN_DOCLING_MODEL, and ~/.gleann/models)")
+	if err := eng.loadModelLocked(); err != nil {
+		return eng, err
+	}
+	return eng, nil
+}
+
+func (e *EIFDoclingEngine) loadModelLocked() error {
+	if e.loaded {
+		return nil
+	}
+	if e.modelPath == "" {
+		return fmt.Errorf("no docling model found (checked --model, GLEANN_DOCLING_MODEL, and ~/.gleann/models)")
 	}
 
 	configureThreads()
 
-	cModel := C.CString(resolvedModel)
+	cModel := C.CString(e.modelPath)
 	defer C.free(unsafe.Pointer(cModel))
 
 	var cTok *C.char
-	if resolvedTok != "" {
-		cTok = C.CString(resolvedTok)
+	if e.tokenizerPath != "" {
+		cTok = C.CString(e.tokenizerPath)
 		defer C.free(unsafe.Pointer(cTok))
 	}
 
-	ret := C.eif_llm_load(&eng.llm, cModel, cTok, nil, 0)
+	ret := C.eif_llm_load(&e.llm, cModel, cTok, nil, 0)
 	if ret != 0 {
-		return eng, fmt.Errorf("eif_llm_load failed with code %d for model %s", int(ret), resolvedModel)
+		return fmt.Errorf("eif_llm_load failed with code %d for model %s", int(ret), e.modelPath)
 	}
 
-	eng.loaded = true
-	log.Printf("[docling-eif] successfully loaded model: %s", resolvedModel)
-	return eng, nil
+	e.loaded = true
+	log.Printf("[docling-eif] successfully loaded model: %s", e.modelPath)
+	return nil
 }
 
 func (e *EIFDoclingEngine) IsAvailable() bool {
@@ -229,7 +239,15 @@ func (e *EIFDoclingEngine) convertImage(imagePath string) (string, error) {
 	defer e.mu.Unlock()
 
 	if !e.loaded {
-		return "", fmt.Errorf("image/scanned-page conversion needs the VLM, which is disabled or not loaded (set GLEANN_DOCLING_VLM=1)")
+		if !vlmEnabled() {
+			return "", fmt.Errorf("image/scanned-page conversion needs the VLM, which is disabled or not loaded (set GLEANN_DOCLING_VLM=1)")
+		}
+		if e.modelPath == "" {
+			return "", fmt.Errorf("image/scanned-page conversion needs the VLM, which is disabled or not loaded (set GLEANN_DOCLING_VLM=1)")
+		}
+		if err := e.loadModelLocked(); err != nil {
+			return "", fmt.Errorf("failed to lazy-load VLM: %w (set GLEANN_DOCLING_VLM=1)", err)
+		}
 	}
 
 	cImg := C.CString(imagePath)
@@ -261,6 +279,14 @@ const minPageTextChars = 20
 // default only the text layer and the native Office extractors are used.
 func vlmEnabled() bool {
 	return envTrue("GLEANN_DOCLING_VLM") || envTrue("GLEANN_DOCLING_FORCE_VLM")
+}
+
+func envExplicitlyDisabled(name string) bool {
+	switch strings.ToLower(os.Getenv(name)) {
+	case "0", "false", "no", "off":
+		return true
+	}
+	return false
 }
 
 func envTrue(name string) bool {
