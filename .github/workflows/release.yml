@@ -1,0 +1,174 @@
+name: CI/CD Release
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential poppler-utils
+
+      - name: Build bitllm.c
+        run: |
+          cmake -B ext/bitllm.c/build -S ext/bitllm.c -DCMAKE_BUILD_TYPE=Release
+          cmake --build ext/bitllm.c/build --target bitllm_static -j$(nproc)
+
+      - name: Run Tests
+        run: go test -v -race -timeout 5m ./...
+
+  build-linux-amd64:
+    name: Build Linux AMD64
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build bitllm.c
+        run: |
+          cmake -B ext/bitllm.c/build -S ext/bitllm.c -DCMAKE_BUILD_TYPE=Release
+          cmake --build ext/bitllm.c/build --target bitllm_static -j$(nproc)
+
+      - name: Build Binary
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o dist/gleann-plugin-docs-linux-amd64 ./cmd/gleann-plugin-docs
+          cd dist
+          tar -czf gleann-plugin-docs-linux-amd64.tar.gz gleann-plugin-docs-linux-amd64
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gleann-plugin-docs-linux-amd64
+          path: dist/*
+
+  build-linux-arm64:
+    name: Build Linux ARM64
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
+
+      - name: Cross-compile bitllm.c for ARM64
+        run: |
+          cmake -B ext/bitllm.c/build -S ext/bitllm.c \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build ext/bitllm.c/build --target bitllm_static -j$(nproc)
+
+      - name: Build Binary for Linux ARM64
+        run: |
+          mkdir -p dist
+          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+            -o dist/gleann-plugin-docs-linux-arm64 ./cmd/gleann-plugin-docs
+          cd dist
+          tar -czf gleann-plugin-docs-linux-arm64.tar.gz gleann-plugin-docs-linux-arm64
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gleann-plugin-docs-linux-arm64
+          path: dist/*
+
+  build-darwin-arm64:
+    name: Build macOS ARM64 (Apple Silicon)
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build bitllm.c natively on macOS ARM64
+        run: |
+          cmake -B ext/bitllm.c/build -S ext/bitllm.c -DCMAKE_BUILD_TYPE=Release
+          cmake --build ext/bitllm.c/build --target bitllm_static -j$(sysctl -n hw.ncpu)
+
+      - name: Build Binary for macOS ARM64
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+            -o dist/gleann-plugin-docs-darwin-arm64 ./cmd/gleann-plugin-docs
+          cd dist
+          tar -czf gleann-plugin-docs-darwin-arm64.tar.gz gleann-plugin-docs-darwin-arm64
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gleann-plugin-docs-darwin-arm64
+          path: dist/*
+
+  release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          cd dist
+          sha256sum * > checksums.txt
+          ls -la
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
