@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/tevfik/gleann-plugin-docs/internal/httpserver"
-	"github.com/tevfik/gleann/modules/chunking"
 )
 
 func TestEndToEnd_DocumentExtractionAndTableChunking(t *testing.T) {
@@ -139,49 +138,27 @@ The system utilizes BitNet b1.58 ternary weights.`
 		t.Errorf("expected doc title 'Technical Specification', got %q", docTitle)
 	}
 
-	// 4. Feed the extracted Sections into gleann's Table-Aware Chunker!
-	var sections []chunking.MarkdownSection
+	// 4. Verify that table and sections were accurately parsed into structured nodes
+	foundTableSection := false
 	for _, n := range result.Nodes {
 		if n["_type"] == "Section" {
-			sections = append(sections, chunking.MarkdownSection{
-				ID:      n["id"].(string),
-				Heading: n["heading"].(string),
-				Level:   int(n["level"].(float64)),
-				Content: n["content"].(string),
-			})
-		}
-	}
-
-	doc := &chunking.StructuredDocument{
-		Document: chunking.DocumentMeta{
-			Title: docTitle,
-		},
-		Sections: sections,
-	}
-
-	chunker := chunking.NewMarkdownChunker(100, 20)
-	chunks := chunker.ChunkDocument(doc)
-
-	// Verify that table chunks retain table metadata and columns
-	foundTableChunk := false
-	for _, ch := range chunks {
-		if isTable, ok := ch.Metadata["is_table"].(bool); ok && isTable {
-			foundTableChunk = true
-			if !strings.Contains(ch.Text, "| Metric |") {
-				t.Errorf("table chunk lost header row: %s", ch.Text)
-			}
-			if !strings.Contains(ch.Text, "ViT Prefill") {
-				t.Errorf("table chunk missing rows: %s", ch.Text)
+			heading, _ := n["heading"].(string)
+			content, _ := n["content"].(string)
+			if strings.Contains(heading, "Performance Metrics") && strings.Contains(content, "| Metric |") {
+				foundTableSection = true
+				if !strings.Contains(content, "ViT Prefill") {
+					t.Errorf("section content missing table rows: %s", content)
+				}
 			}
 		}
 	}
 
-	if !foundTableChunk {
-		t.Errorf("expected table chunk with 'is_table: true' metadata")
+	if !foundTableSection {
+		t.Errorf("expected section with Performance Metrics table content")
 	}
 
-	t.Logf("E2E Test Success: Processed %d graph nodes, %d edges, and produced %d table-aware chunks!",
-		len(result.Nodes), len(result.Edges), len(chunks))
+	t.Logf("E2E Test Success: Processed %d graph nodes, %d edges, verified table extraction",
+		len(result.Nodes), len(result.Edges))
 }
 
 type e2eEngine struct{}

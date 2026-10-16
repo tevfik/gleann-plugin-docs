@@ -1,8 +1,8 @@
 package engine
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../ext/bitllm.c/include -I${SRCDIR}/../../../../gleann/ext/eif-runtime/include -O3 -fopenmp
-#cgo linux LDFLAGS: ${SRCDIR}/../../ext/bitllm.c/build/libbitllm.a -Wl,-Bstatic -lgomp -Wl,-Bdynamic -lpthread -lm
+#cgo CFLAGS: -I${SRCDIR}/../../ext/bitllm.c/include -O3 -fopenmp
+#cgo linux LDFLAGS: ${SRCDIR}/../../ext/bitllm.c/build/libbitllm.a -fopenmp -lpthread -lm
 #cgo darwin LDFLAGS: ${SRCDIR}/../../ext/bitllm.c/build/libbitllm.a -lm
 #cgo windows LDFLAGS: ${SRCDIR}/../../ext/bitllm.c/build/libbitllm.a -lm
 #include "bitllm.h"
@@ -145,7 +145,12 @@ func (e *EIFDoclingEngine) loadModelLocked() error {
 }
 
 func (e *EIFDoclingEngine) IsAvailable() bool {
-	return e != nil
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.loaded || e.hybrid != nil
 }
 
 func (e *EIFDoclingEngine) BackendName() string {
