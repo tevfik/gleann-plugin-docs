@@ -136,6 +136,47 @@ func DefaultModels(p OCRProfile) []ModelSpec {
 	return append([]ModelSpec{LayoutModel}, p.Specs()...)
 }
 
+// VLM Model constants for Granite Docling BitNet 1.58b VLM
+const (
+	VLMModelDirEnv = "GLEANN_DOCLING_MODELS"
+)
+
+var (
+	// VLMModel is the quantized BitNet b1.58 ternary vision-language model for Docling.
+	VLMModel = ModelSpec{
+		Name:   "vlm",
+		File:   "granite_docling_bitnet_dense.eifm",
+		URL:    "https://huggingface.co/tevfikk/granite-docling-258M-bitnet/resolve/main/granite_docling_bitnet_dense.eifm",
+		SHA256: "0c63088453124aae2d8b8d4203265b278f932aa17aa1039c80a3aa213c0b84c9",
+		Size:   263676400,
+	}
+	// VLMTokenizer is the byte-level BPE tokenizer for the Granite VLM.
+	VLMTokenizer = ModelSpec{
+		Name:   "vlm_tok",
+		File:   "tokenizer.bin",
+		URL:    "https://huggingface.co/tevfikk/granite-docling-258M-bitnet/resolve/main/tokenizer.bin",
+		SHA256: "da9899cd5e597030102000e918482ace9ad80d31d7fb9d1943863eb4a1af1df9",
+		Size:   1521105,
+	}
+)
+
+// VLMModelDir returns ~/.gleann/models/granite-docling or $GLEANN_DOCLING_MODELS.
+func VLMModelDir() string {
+	if d := os.Getenv(VLMModelDirEnv); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".gleann", "models", "granite-docling")
+	}
+	return filepath.Join(home, ".gleann", "models", "granite-docling")
+}
+
+// VLMModels returns the model specs needed for the Granite VLM.
+func VLMModels() []ModelSpec {
+	return []ModelSpec{VLMModel, VLMTokenizer}
+}
+
 // ModelDir returns the directory holding the ONNX models:
 // $GLEANN_DOCPARSER_MODELS, else ~/.gleann/models/docparser.
 func ModelDir() string {

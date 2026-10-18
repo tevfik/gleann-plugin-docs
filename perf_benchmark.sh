@@ -15,6 +15,7 @@ ITER=3
 DIR="testdata/documents"
 JSON_OUTPUT=false
 ENABLE_ONNX=1
+ENABLE_VLM=0
 
 usage() {
     cat <<EOF
@@ -25,10 +26,12 @@ Options:
   -d, --dir <DIR>      Path to document directory (default: testdata/documents)
       --json           Output results in JSON format
       --no-ocr         Disable ONNX OCR (fast-path text extraction only)
+      --vlm            Enable Granite Docling BitNet VLM for deep vision OCR/tables
   -h, --help           Show this help message
 
 Examples:
   ./perf_benchmark.sh                   # Run full benchmark with ONNX layout & OCR
+  ./perf_benchmark.sh --vlm             # Run benchmark with Granite Docling BitNet VLM
   ./perf_benchmark.sh -n 5              # Average over 5 runs
   ./perf_benchmark.sh --no-ocr          # Run digital document extraction only
   ./perf_benchmark.sh --json > report.json
@@ -53,6 +56,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-ocr)
             ENABLE_ONNX=0
+            shift
+            ;;
+        --vlm)
+            ENABLE_VLM=1
             shift
             ;;
         -h|--help)
@@ -107,6 +114,20 @@ else
     export GLEANN_DOCLING_ONNX=0
     if [ "$JSON_OUTPUT" = false ]; then
         echo "ONNX Layout & OCR : DISABLED (Digital text-layer extraction only)"
+    fi
+fi
+
+if [ "$ENABLE_VLM" -eq 1 ]; then
+    export GLEANN_DOCLING_VLM=1
+    VLM_DIR="${GLEANN_DOCLING_MODELS:-$HOME/.gleann/models/granite-docling}"
+    if [ ! -f "$VLM_DIR/granite_docling_bitnet_dense.eifm" ]; then
+        if [ "$JSON_OUTPUT" = false ]; then
+            echo "Downloading Granite Docling BitNet VLM model to $VLM_DIR..."
+        fi
+        go run ./cmd/gleann-plugin-docs models download --vlm
+    fi
+    if [ "$JSON_OUTPUT" = false ]; then
+        echo "Granite BitNet VLM: ENABLED (~264 MB ternary model, bitllm.c)"
     fi
 fi
 

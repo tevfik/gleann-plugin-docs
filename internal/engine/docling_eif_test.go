@@ -68,8 +68,8 @@ func TestEIFDoclingEngine_LiveInference(t *testing.T) {
 		t.Errorf("expected docling-eif backend, got %s", eng.BackendName())
 	}
 
-	// Test with uploaded artifact image if available
-	testImg := "/home/tevfik/.gemini/antigravity-ide/brain/06e00095-93b8-465d-810a-2c0107832d7f/.user_uploaded/media_1791460303106.png"
+	// Test with testdata image
+	testImg := "../../testdata/documents/scanned_table.png"
 	if _, err := os.Stat(testImg); err == nil {
 		ctx := context.Background()
 		md, pages, err := eng.Convert(ctx, testImg)

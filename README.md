@@ -26,12 +26,12 @@ The plugin acts as a **document structure expert** — like the AST code indexer
 
 ### Key Capabilities
 
-1. **Embedded Granite Docling BitNet 1.58-bit VLM**: In-process quantized vision-language model for OCR and OTSL (Open Table Structure Language) table layout parsing. No external Python server required.
-2. **Hybrid PDF Fast-Path**: Searchable digital PDFs extract in **~0.05s** via `pdftotext`, while scanned, image-heavy, or raster pages automatically route through the Docling BitNet VLM.
+1. **Embedded Granite Docling BitNet 1.58-bit VLM ([`tevfikk/granite-docling-258M-bitnet`](https://huggingface.co/tevfikk/granite-docling-258M-bitnet))**: In-process quantized vision-language model for OCR and OTSL (Open Table Structure Language) table layout parsing. Now compressed from 518 MB down to **264 MB** using BitNet ternary weights and INT8 per-row ViT projections in `bitllm.c`. Download with `gleann-plugin-docs models download --vlm` and enable with `GLEANN_DOCLING_VLM=1`.
+2. **Hybrid PDF Fast-Path**: Searchable digital PDFs extract in **~0.05s** via `pdftotext`, while scanned, image-heavy, or raster pages automatically route through the Docling BitNet VLM or the lightweight ONNX parser.
 3. **Pure Go DOCX/Office Parser**: Fast in-process XML unzipping and paragraph/heading extraction without third-party converters.
 4. **Hierarchical Graph Generation**: Emits `Document` and nested `Section` nodes with `HAS_SECTION` and `HAS_SUBSECTION` edges ready for Gleann's KùzuDB knowledge graph.
 5. **Table-Aware Extraction**: Tables are cleanly extracted in markdown table syntax, preserving tabular data integrity during chunking. OTSL tables with merged cells (`lcel`, `ucel`, `xcel`) are rendered as HTML tables with `colspan`/`rowspan`.
-6. **Optional ONNX page parser (CPU, ~1–2 s/page)**: layout detection + PaddleOCR through ONNX Runtime for scanned pages and images, including Turkish. Off by default; enable with `GLEANN_DOCLING_ONNX=1`. See [ONNX_BACKEND.md](ONNX_BACKEND.md) for setup, measured accuracy and limits.
+6. **Optional ONNX page parser (CPU, ~0.5–1 s/page)**: layout detection + PaddleOCR through ONNX Runtime for scanned pages and images (~23 MB total). Off by default; enable with `GLEANN_DOCLING_ONNX=1`. See [ONNX_BACKEND.md](ONNX_BACKEND.md) for setup, measured accuracy and limits.
 
 ---
 

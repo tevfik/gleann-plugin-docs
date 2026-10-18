@@ -228,13 +228,14 @@ func installPlugin(port int) error {
 }
 
 // runModels implements `gleann-plugin-docs models <download|verify|list>`: the
-// ONNX models of the hybrid page parser (layout + OCR, ~23 MB in total).
+// ONNX models of the hybrid page parser (~23 MB) or the Granite VLM model (~264 MB).
 func runModels(args []string) int {
 	fs := flag.NewFlagSet("models", flag.ContinueOnError)
-	dir := fs.String("dir", docparser.ModelDir(), "model directory (default $GLEANN_DOCPARSER_MODELS or ~/.gleann/models/docparser)")
-	profile := fs.String("profile", "", "OCR model set: latin (default, includes Turkish), chinese, or all")
+	dir := fs.String("dir", "", "model directory (default: ~/.gleann/models/docparser, or ~/.gleann/models/granite-docling for --vlm)")
+	profile := fs.String("profile", "", "model set: latin (default), chinese, all, or vlm")
+	vlmFlag := fs.Bool("vlm", false, "manage Granite Docling BitNet VLM model (tevfikk/granite-docling-258M-bitnet)")
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs models <download|verify|list> [--dir DIR]")
+		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs models <download|verify|list> [--vlm] [--profile latin|chinese|all|vlm] [--dir DIR]")
 		return 2
 	}
 	action := args[0]
@@ -242,25 +243,42 @@ func runModels(args []string) int {
 		return 2
 	}
 
-	specs, err := modelSpecs(*profile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 2
+	isVLM := *vlmFlag || strings.EqualFold(*profile, "vlm")
+
+	targetDir := *dir
+	if targetDir == "" {
+		if isVLM {
+			targetDir = docparser.VLMModelDir()
+		} else {
+			targetDir = docparser.ModelDir()
+		}
+	}
+
+	var specs []docparser.ModelSpec
+	var err error
+	if isVLM {
+		specs = docparser.VLMModels()
+	} else {
+		specs, err = modelSpecs(*profile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 2
+		}
 	}
 
 	switch action {
 	case "list":
 		for _, m := range specs {
 			status := "missing"
-			if err := docparser.VerifyModel(*dir, m); err == nil {
+			if err := docparser.VerifyModel(targetDir, m); err == nil {
 				status = "ok"
 			}
-			fmt.Printf("%-8s %-30s %9d bytes  %s\n", m.Name, m.File, m.Size, status)
+			fmt.Printf("%-8s %-35s %10d bytes  %s\n", m.Name, m.File, m.Size, status)
 		}
 	case "verify":
 		bad := 0
 		for _, m := range specs {
-			if err := docparser.VerifyModel(*dir, m); err != nil {
+			if err := docparser.VerifyModel(targetDir, m); err != nil {
 				fmt.Printf("FAIL %s: %v\n", m.File, err)
 				bad++
 			} else {
@@ -271,12 +289,12 @@ func runModels(args []string) int {
 			return 1
 		}
 	case "download":
-		err := docparser.EnsureModels(context.Background(), *dir, specs, func(s string) { fmt.Println(s) })
+		err := docparser.EnsureModels(context.Background(), targetDir, specs, func(s string) { fmt.Println(s) })
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			return 1
 		}
-		fmt.Printf("models are in %s\n", *dir)
+		fmt.Printf("models are in %s\n", targetDir)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown models action %q\n", action)
 		return 2
