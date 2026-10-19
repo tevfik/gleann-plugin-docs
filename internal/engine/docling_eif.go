@@ -84,6 +84,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
@@ -301,7 +302,7 @@ func (e *EIFDoclingEngine) runVision(imagePath, prompt string) (string, error) {
 	}
 	defer C.free(unsafe.Pointer(cRes))
 
-	rawDocTags := C.GoString(cRes)
+	rawDocTags := cleanVLMText(C.GoString(cRes))
 	if os.Getenv("GLEANN_DOCLING_DEBUG") == "1" {
 		log.Printf("[docling-eif] raw doctags (%d bytes) for %s:\n%s", len(rawDocTags), imagePath, rawDocTags)
 	}
@@ -560,4 +561,14 @@ func resolveModelPaths(modelPath, tokenizerPath string) (string, string) {
 	}
 
 	return "", ""
+}
+
+// cleanVLMText drops invalid UTF-8 from the VLM output. The decoder occasionally emits a lone
+// continuation byte or a truncated multi-byte sequence (mostly on Turkish diacritics); passed on
+// unchanged, that breaks JSON encoding and strict UTF-8 consumers of the converted markdown.
+func cleanVLMText(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "")
 }
