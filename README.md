@@ -2,7 +2,7 @@
 
 High-performance, self-contained native document extraction plugin for [gleann](https://github.com/tevfik/gleann). Converts PDF, DOCX, XLSX, PPTX, CSV, and image documents into **graph-ready** structured data (`Document`, `Section`, `HAS_SECTION`, `HAS_SUBSECTION`) that gleann ingests directly into KùzuDB + HNSW.
 
-Written in **pure Go** with an embedded **C inference runtime** (`eif-runtime`). **Zero Python or PyTorch runtime dependencies** — compiles to a single, portable ~9.6MB binary.
+Written in **pure Go** with an embedded **C inference runtime** ([`bitllm.c`](https://github.com/tevfik/bitllm.c), formerly `eif-runtime`). **Zero Python or PyTorch runtime dependencies** — compiles to a single, portable ~9.6MB binary.
 
 ## Architecture
 
@@ -43,7 +43,7 @@ The plugin acts as a **document structure expert** — like the AST code indexer
 
 ## Installation & Build
 
-**Prerequisites:** Go 1.22+ and a standard C compiler (for `eif-runtime`). Optional: `pdftotext` (poppler-utils) for the PDF hybrid fast-path.
+**Prerequisites:** Go 1.22+ and a standard C compiler (for `bitllm.c`). Optional: `pdftotext` (poppler-utils) for the PDF hybrid fast-path.
 
 ```bash
 # 1. Build the standalone binary
@@ -108,11 +108,9 @@ Returns plugin capabilities and supported extensions:
 ### `POST /convert`
 Extracts structured hierarchy from a document.
 
-**Request:**
-```json
-{
-  "path": "/absolute/path/to/report.pdf"
-}
+**Request:** `multipart/form-data` with the document in the `file` field:
+```bash
+curl -F "file=@/path/to/report.pdf" http://localhost:<port>/convert
 ```
 
 **Response:**
