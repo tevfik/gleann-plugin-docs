@@ -17,7 +17,7 @@ import (
 
 const (
 	PluginName    = "gleann-plugin-docs"
-	PluginVersion = "1.2.0"
+	PluginVersion = "1.3.0"
 	SchemaVersion = 2
 )
 
