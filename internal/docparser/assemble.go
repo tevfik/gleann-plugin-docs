@@ -175,6 +175,10 @@ func gridMarkdown(lines []TextLine) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+// GridMarkdown rebuilds a Markdown table from text pieces and their boxes (see
+// gridMarkdown); "" means no table of two rows and two columns was found.
+func GridMarkdown(lines []TextLine) string { return gridMarkdown(lines) }
+
 func centerY(r image.Rectangle) int { return r.Min.Y + r.Dy()/2 }
 
 func rowCenter(row []TextLine) int {

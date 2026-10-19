@@ -84,6 +84,23 @@ func (p *Parser) Close() error {
 	return err
 }
 
+// TableBoxes returns the table regions the layout model finds on the page, in
+// image pixels. It runs only layout analysis (no OCR), so it is cheap enough to
+// ask of every page of a digital PDF.
+func (p *Parser) TableBoxes(img image.Image) ([]image.Rectangle, error) {
+	boxes, err := p.layout.Detect(img)
+	if err != nil {
+		return nil, err
+	}
+	var tables []image.Rectangle
+	for _, b := range dropNested(boxes) {
+		if b.Type == TypeTable {
+			tables = append(tables, b.Rect)
+		}
+	}
+	return tables, nil
+}
+
 // ParsePage returns the Markdown of one page image.
 func (p *Parser) ParsePage(ctx context.Context, img image.Image) (string, error) {
 	blocks, _, err := p.ParsePageBlocks(ctx, img)

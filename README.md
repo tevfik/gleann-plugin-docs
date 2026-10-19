@@ -26,12 +26,14 @@ The plugin acts as a **document structure expert** — like the AST code indexer
 
 ### Key Capabilities
 
-1. **Embedded Granite Docling BitNet 1.58-bit VLM ([`tevfikk/granite-docling-258M-bitnet`](https://huggingface.co/tevfikk/granite-docling-258M-bitnet))**: In-process quantized vision-language model for OCR and OTSL (Open Table Structure Language) table layout parsing. Now compressed from 518 MB down to **264 MB** using BitNet ternary weights and INT8 per-row ViT projections in `bitllm.c`. Download with `gleann-plugin-docs models download --vlm` and enable with `GLEANN_DOCLING_VLM=1`.
-2. **Hybrid PDF Fast-Path**: Searchable digital PDFs extract in **~0.05s** via `pdftotext`, while scanned, image-heavy, or raster pages automatically route through the Docling BitNet VLM or the lightweight ONNX parser.
+1. **Embedded Granite Docling BitNet 1.58-bit VLM ([`tevfikk/granite-docling-258M-bitnet`](https://huggingface.co/tevfikk/granite-docling-258M-bitnet))**: In-process quantized vision-language model for OCR and OTSL (Open Table Structure Language) table layout parsing. Now compressed from 518 MB down to **264 MB** using BitNet ternary weights and INT8 per-row ViT projections in `bitllm.c`. Download with `gleann-plugin-docs models download --vlm`; it is used automatically when installed (`GLEANN_DOCLING_VLM=1` loads it at startup, `=0` disables it).
+2. **Per-page PDF routing (automatic)**: every page is classified on its own.
+   - *Digital page (has a text layer)*: text comes from `pdftotext` (**~0.05s**, exact). If the ONNX parser is installed, its layout model also looks for tables; each table is rebuilt as a Markdown table from the positions of the text-layer words (no OCR, so no recognition errors) and spliced into the page. Without the parser, tables stay flat text.
+   - *Scanned page (no text layer)*: read by the Granite-Docling VLM (loaded on first use) for up to `GLEANN_DOCLING_VLM_MAX_PAGES` pages per document (default 20); beyond that, or when the VLM is not installed or fails, by the ONNX OCR parser. If neither is available the page is skipped with a warning.
 3. **Pure Go DOCX/Office Parser**: Fast in-process XML unzipping and paragraph/heading extraction without third-party converters.
 4. **Hierarchical Graph Generation**: Emits `Document` and nested `Section` nodes with `HAS_SECTION` and `HAS_SUBSECTION` edges ready for Gleann's KùzuDB knowledge graph.
 5. **Table-Aware Extraction**: Tables are cleanly extracted in markdown table syntax, preserving tabular data integrity during chunking. OTSL tables with merged cells (`lcel`, `ucel`, `xcel`) are rendered as HTML tables with `colspan`/`rowspan`.
-6. **Optional ONNX page parser (CPU, ~0.5–1 s/page)**: layout detection + PaddleOCR through ONNX Runtime for scanned pages and images (~23 MB total). Off by default; enable with `GLEANN_DOCLING_ONNX=1`. See [ONNX_BACKEND.md](ONNX_BACKEND.md) for setup, measured accuracy and limits.
+6. **Optional ONNX page parser (CPU, ~0.5–1 s/page)**: layout detection + PaddleOCR through ONNX Runtime for scanned pages and images (~23 MB total). Starts automatically when its models and `libonnxruntime` are installed (`GLEANN_DOCLING_ONNX=1` forces it on and downloads missing models, `=0` turns it off). See [ONNX_BACKEND.md](ONNX_BACKEND.md) for setup, measured accuracy and limits.
 
 ---
 
@@ -134,7 +136,7 @@ curl -F "file=@/path/to/report.pdf" http://localhost:<port>/convert
 
 ```bash
 make download-doc-models                                   # ~20 MB, SHA-256 verified
-GLEANN_DOCLING_ONNX=1 ./bin/gleann-plugin-docs convert scan.pdf
+./bin/gleann-plugin-docs convert scan.pdf   # ONNX parser starts by itself once the models are installed
 make bench-docparser PDF=paper.pdf PAGES=1-3               # accuracy/latency against the PDF's text layer
 ```
 
