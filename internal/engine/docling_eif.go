@@ -43,8 +43,10 @@ static void docling_set_threads(int n) {
 #endif
 }
 
-static char *c_run_docling_vision(eif_llm_t *llm, const char *image_path, const char *prompt, int max_tokens, float rep_penalty) {
+// nthr is applied inside the call: the OpenMP team size is per OS thread and cgo calls may land on any thread.
+static char *c_run_docling_vision(eif_llm_t *llm, const char *image_path, const char *prompt, int max_tokens, float rep_penalty, int nthr) {
     if (!llm || !image_path) return NULL;
+    docling_set_threads(nthr);
 
     docling_buf_t b;
     b.cap = 65536;
@@ -63,6 +65,40 @@ static char *c_run_docling_vision(eif_llm_t *llm, const char *image_path, const 
 
     const char *p = prompt ? prompt : "Convert this page to docling.";
     int res = eif_llm_generate_vision_docling(llm, image_path, p, &cfg, docling_token_collector, &b);
+    if (res < 0) {
+        free(b.buf);
+        return NULL;
+    }
+    return b.buf;
+}
+
+// Page pipelining: the encoder of page i+1 and the decoder of page i run on different threads; each helper
+// sets the OpenMP team size of its own OS thread inside the same C call.
+static int c_encode_page(eif_llm_t *llm, const char *image_path, int nthr, eif_llm_vision_input_t *out) {
+    docling_set_threads(nthr);
+    return eif_llm_encode_vision_docling(llm, image_path, out);
+}
+
+static char *c_generate_page(eif_llm_t *llm, const eif_llm_vision_input_t *vin, const char *prompt, int max_tokens,
+                             float rep_penalty, int nthr) {
+    docling_set_threads(nthr);
+    docling_buf_t b;
+    b.cap = 65536;
+    b.len = 0;
+    b.buf = (char *)malloc(b.cap);
+    if (!b.buf) return NULL;
+    b.buf[0] = '\0';
+
+    eif_llm_gen_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.max_new_tokens = max_tokens > 0 ? max_tokens : 1024;
+    cfg.temperature = 0.0f;
+    cfg.top_p = 0.90f;
+    cfg.repetition_penalty = rep_penalty;
+    cfg.eos_token_id = -1;
+
+    int res = eif_llm_generate_vision_docling_from(llm, vin, prompt ? prompt : "Convert this page to docling.", &cfg,
+                                                   docling_token_collector, &b);
     if (res < 0) {
         free(b.buf);
         return NULL;
@@ -249,15 +285,41 @@ func configureThreads() {
 	if os.Getenv("OMP_NUM_THREADS") != "" && os.Getenv("GLEANN_DOCLING_THREADS") == "" {
 		return
 	}
+	C.docling_set_threads(C.int(threadBudget()))
+}
+
+// threadBudget is the OpenMP team size used for the VLM (see configureThreads).
+func threadBudget() int {
 	n := runtime.NumCPU() / 2
+	if v, err := strconv.Atoi(os.Getenv("OMP_NUM_THREADS")); err == nil && v > 0 && os.Getenv("GLEANN_DOCLING_THREADS") == "" {
+		n = v
+	}
 	if v, err := strconv.Atoi(os.Getenv("GLEANN_DOCLING_THREADS")); err == nil && v > 0 {
 		n = v
 	}
 	if n < 4 {
 		n = 4
 	}
-	C.docling_set_threads(C.int(n))
+	return n
 }
+
+// pipelineThreads splits the thread budget between the vision encoder of the next page and the decoder of
+// the current page. Decoding scales poorly past a few threads, the ViT is compute bound (measured on a
+// 20-core ARM: 14 / 6 of 20 threads gave 1.33x on 3 pages over running the pages one after another).
+func pipelineThreads(budget int) (vit, dec int) {
+	dec = budget * 3 / 10
+	if dec < 2 {
+		dec = 2
+	}
+	vit = budget - dec
+	if vit < 2 {
+		vit = 2
+	}
+	return vit, dec
+}
+
+// pipelineEnabled: GLEANN_DOCLING_PIPELINE=0 turns page pipelining off.
+func pipelineEnabled() bool { return os.Getenv("GLEANN_DOCLING_PIPELINE") != "0" }
 
 func repetitionPenalty() float64 {
 	if v, err := strconv.ParseFloat(os.Getenv("GLEANN_DOCLING_REP_PENALTY"), 64); err == nil && v > 0 {
@@ -280,14 +342,8 @@ func (e *EIFDoclingEngine) runVision(imagePath, prompt string) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if !e.loaded {
-		if vlmEnabled() && e.modelPath != "" {
-			if err := e.loadModelLocked(); err != nil {
-				return "", fmt.Errorf("failed to lazy-load VLM: %w", err)
-			}
-		} else {
-			return "", fmt.Errorf("image/scanned-page conversion needs OCR or the VLM, and neither is available (set GLEANN_DOCLING_ONNX=1 after `gleann-plugin-docs models download`, or GLEANN_DOCLING_VLM=1)")
-		}
+	if err := e.ensureLoadedLocked(); err != nil {
+		return "", err
 	}
 
 	cImg := C.CString(imagePath)
@@ -296,7 +352,7 @@ func (e *EIFDoclingEngine) runVision(imagePath, prompt string) (string, error) {
 	cPrompt := C.CString(prompt)
 	defer C.free(unsafe.Pointer(cPrompt))
 
-	cRes := C.c_run_docling_vision(&e.llm, cImg, cPrompt, 1024, C.float(repetitionPenalty()))
+	cRes := C.c_run_docling_vision(&e.llm, cImg, cPrompt, 1024, C.float(repetitionPenalty()), C.int(threadBudget()))
 	if cRes == nil {
 		return "", fmt.Errorf("vision inference returned null")
 	}
@@ -423,6 +479,34 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 	if len(scanned) > 0 {
 		if !e.canReadScanned() {
 			log.Printf("[docling-eif] %s: %d of %d page(s) have no text layer and were skipped (OCR/VLM not enabled; set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath), len(scanned), len(pages))
+		} else if e.hybrid == nil && len(scanned) > 1 {
+			// VLM only: render the scanned pages, then pipeline them through the model.
+			var imgs []string
+			var pageIdx []int
+			for _, idx := range scanned {
+				if ctx.Err() != nil {
+					return "", 0, ctx.Err()
+				}
+				r, cleanup, err := renderPDFPagesDPI(ctx, pdfPath, idx+1, idx+1, e.pageDPI())
+				if err != nil {
+					log.Printf("[docling-eif] warning: page %d: %v", idx+1, err)
+					continue
+				}
+				defer cleanup()
+				imgs = append(imgs, r[0])
+				pageIdx = append(pageIdx, idx)
+			}
+			mds, errs := e.convertImagesVLM(ctx, imgs)
+			for k, idx := range pageIdx {
+				if errs[k] != nil {
+					if ctx.Err() != nil {
+						return "", 0, ctx.Err()
+					}
+					log.Printf("[docling-eif] warning: failed page %d: %v", idx+1, errs[k])
+					continue
+				}
+				result[idx] = mds[k]
+			}
 		} else {
 			for _, idx := range scanned {
 				if ctx.Err() != nil {
@@ -468,7 +552,23 @@ func (e *EIFDoclingEngine) convertPDFAllVLM(ctx context.Context, pdfPath string)
 	defer cleanup()
 
 	var pageMarkdowns []string
+	if e.hybrid == nil {
+		mds, errs := e.convertImagesVLM(ctx, imgs)
+		for i, md := range mds {
+			if errs[i] != nil {
+				if ctx.Err() != nil {
+					return "", 0, ctx.Err()
+				}
+				log.Printf("[docling-eif] warning: failed page %s: %v", imgs[i], errs[i])
+				continue
+			}
+			pageMarkdowns = append(pageMarkdowns, md)
+		}
+	}
 	for _, img := range imgs {
+		if e.hybrid == nil {
+			break
+		}
 		if ctx.Err() != nil {
 			return "", 0, ctx.Err()
 		}
@@ -571,4 +671,99 @@ func cleanVLMText(s string) string {
 		return s
 	}
 	return strings.ToValidUTF8(s, "")
+}
+
+func (e *EIFDoclingEngine) ensureLoadedLocked() error {
+	if e.loaded {
+		return nil
+	}
+	if vlmEnabled() && e.modelPath != "" {
+		if err := e.loadModelLocked(); err != nil {
+			return fmt.Errorf("failed to lazy-load VLM: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("image/scanned-page conversion needs OCR or the VLM, and neither is available (set GLEANN_DOCLING_ONNX=1 after `gleann-plugin-docs models download`, or GLEANN_DOCLING_VLM=1)")
+}
+
+type encodedPage struct {
+	v  C.eif_llm_vision_input_t
+	rc C.int
+}
+
+func (e *EIFDoclingEngine) encodePage(path string, threads int) *encodedPage {
+	cImg := C.CString(path)
+	defer C.free(unsafe.Pointer(cImg))
+	p := &encodedPage{}
+	p.rc = C.c_encode_page(&e.llm, cImg, C.int(threads), &p.v)
+	return p
+}
+
+// convertImagesVLM converts page images with the VLM. With two or more pages it pipelines them: page i+1
+// is encoded on another goroutine while page i is decoded. Results and errors are per page.
+func (e *EIFDoclingEngine) convertImagesVLM(ctx context.Context, imgs []string) ([]string, []error) {
+	out := make([]string, len(imgs))
+	errs := make([]error, len(imgs))
+	if len(imgs) < 2 || !pipelineEnabled() {
+		for i, img := range imgs {
+			if err := ctx.Err(); err != nil {
+				errs[i] = err
+				continue
+			}
+			out[i], errs[i] = e.convertImage(img)
+		}
+		return out, errs
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.ensureLoadedLocked(); err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return out, errs
+	}
+
+	budget := threadBudget()
+	vitThreads, decThreads := pipelineThreads(budget)
+	prompt := C.CString("Convert this page to docling.")
+	defer C.free(unsafe.Pointer(prompt))
+
+	cur := e.encodePage(imgs[0], budget)
+	for i := range imgs {
+		var next chan *encodedPage
+		if i+1 < len(imgs) && ctx.Err() == nil {
+			next = make(chan *encodedPage, 1)
+			go func(path string) { next <- e.encodePage(path, vitThreads) }(imgs[i+1])
+		}
+		threads := budget
+		if next != nil {
+			threads = decThreads
+		}
+		switch {
+		case ctx.Err() != nil:
+			errs[i] = ctx.Err()
+		case cur.rc != 0:
+			errs[i] = fmt.Errorf("vision encoding of %s failed (code %d)", filepath.Base(imgs[i]), int(cur.rc))
+		default:
+			cRes := C.c_generate_page(&e.llm, &cur.v, prompt, 1024, C.float(repetitionPenalty()), C.int(threads))
+			if cRes == nil {
+				errs[i] = fmt.Errorf("vision inference returned null")
+			} else {
+				raw := cleanVLMText(C.GoString(cRes))
+				C.free(unsafe.Pointer(cRes))
+				if os.Getenv("GLEANN_DOCLING_DEBUG") == "1" {
+					log.Printf("[docling-eif] raw doctags (%d bytes) for %s:\n%s", len(raw), imgs[i], raw)
+				}
+				out[i] = parser.DocTagsToMarkdown(raw)
+			}
+		}
+		if cur.rc == 0 {
+			C.eif_llm_vision_input_free(&cur.v)
+		}
+		if next != nil {
+			cur = <-next
+		}
+	}
+	return out, errs
 }
