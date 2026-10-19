@@ -25,7 +25,8 @@
 - [ ] **Better tables and layout for the ONNX path**: a table-structure model instead of the OCR grid, a layout model that knows references, headers and formulas.
 - [ ] **Turkish ı/İ**: normalise or correct the recogniser's dotted/dotless confusion.
 
-- [ ] **Hardware Acceleration**: Enable Metal (macOS) and CUDA/Vulkan (Linux/Windows) inference backends in `bitllm.c` (it has an experimental Vulkan GEMM behind `--gpu`; the ViT dominates page latency).
+- [~] **CPU speed (2026-10-19, bitllm.c `cef6d8a`)**: parallel decode attention (decode 11 -> 4.2 s/page), loop guard (looping Turkish page 40 -> 16 s), page pipelining (`GLEANN_DOCLING_PIPELINE`, ~1.1-1.3x on multi-page), INT8 i8mm ViT (ViT 2.3x quiet), OpenMP team size now set per cgo call (was lost: 2 pages 130 -> 42 s). Page budget on an idle 20-core ARM is now roughly ViT 3.6-5 s + prefill 2.6 s + decode 4 s.
+- [ ] **Hardware Acceleration**: Vulkan in `bitllm.c` works on NVIDIA GB10 (`-DBITLLM_ENABLE_VULKAN=ON`, needs Vulkan headers), output identical to CPU, but the current shader copies operands per call and reaches only ~320 GFLOPS (CPU-level). Needs device-resident weights, the whole ViT layer on the GPU and a tiled / cooperative-matrix shader before it pays off. Metal (macOS) not started.
 - [ ] **Streaming Page Conversion**: Stream extracted sections page-by-page over chunked HTTP for very large (1000+ page) documents.
 - [x] **Native XLSX / PPTX Parsers**: pure Go `internal/engine/xlsx.go`, `pptx.go` (tests in `office_extract_test.go`).
 - [~] **Cross-Platform Prebuilt Binaries**: `release.yml` builds Linux amd64/arm64 and macOS arm64; Windows amd64 is missing.
