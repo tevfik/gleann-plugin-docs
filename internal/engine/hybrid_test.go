@@ -15,18 +15,40 @@ import (
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
 )
 
-func TestHybridIsOffByDefault(t *testing.T) {
+func TestHybridIsOnByDefaultAndCanBeDisabled(t *testing.T) {
 	t.Setenv(envONNX, "")
-	if onnxEnabled() {
-		t.Error("the ONNX parser must be opt-in")
+	if !onnxEnabled() {
+		t.Error("the ONNX parser must be on by default")
+	}
+	for _, v := range []string{"0", "false", "no", "off"} {
+		t.Setenv(envONNX, v)
+		if onnxEnabled() {
+			t.Errorf("%s=%s must disable the parser", envONNX, v)
+		}
 	}
 	eng := &EIFDoclingEngine{}
 	eng.initHybrid()
 	if eng.hybrid != nil || eng.IsAvailable() || eng.canReadScanned() {
-		t.Error("a default engine has neither VLM nor OCR")
+		t.Error("a disabled engine has neither VLM nor OCR")
 	}
 	if eng.pageDPI() != 150 {
 		t.Errorf("default page DPI = %d, want the VLM's 150", eng.pageDPI())
+	}
+}
+
+// With no ONNX Runtime library on the machine the default-on parser must stay
+// quiet and absent (no model download, no failure).
+func TestDefaultOnWithoutORTLibraryIsNotFatal(t *testing.T) {
+	t.Setenv(envONNX, "")
+	t.Setenv(docparser.LibEnv, filepath.Join(t.TempDir(), "missing.so"))
+	t.Setenv(docparser.ModelDirEnv, t.TempDir())
+	eng := &EIFDoclingEngine{}
+	eng.initHybrid()
+	if eng.hybrid != nil || eng.canReadScanned() {
+		t.Fatal("no ORT library: parser must be absent")
+	}
+	if entries, _ := os.ReadDir(docparser.ModelDir()); len(entries) != 0 {
+		t.Errorf("models were downloaded without a usable runtime: %v", entries)
 	}
 }
 
@@ -149,7 +171,7 @@ func TestScannedPDFWithoutOCRStillExplainsItself(t *testing.T) {
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")
 	}
-	t.Setenv(envONNX, "")
+	t.Setenv(envONNX, "0") // no reader at all: ONNX is on by default
 	t.Setenv("GLEANN_DOCLING_VLM", "")
 	t.Setenv("GLEANN_DOCLING_FORCE_VLM", "")
 	pdf := filepath.Join(t.TempDir(), "scanned.pdf")

@@ -26,7 +26,8 @@ var (
 	SupportedExts = []string{
 		".pdf", ".docx", ".doc", ".xlsx", ".xls",
 		".pptx", ".ppt", ".epub", ".html", ".htm",
-		".png", ".jpg", ".jpeg", ".csv", ".txt", ".md",
+		".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
+		".csv", ".txt", ".md",
 	}
 )
 

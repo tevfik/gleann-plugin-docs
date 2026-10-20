@@ -16,11 +16,12 @@ import (
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
 )
 
-// The ONNX hybrid page parser (layout model + PP-OCR) is an opt-in fast path
-// for scanned pages and images. Without it, those pages go to the Granite VLM
-// (GLEANN_DOCLING_VLM=1), which costs 10-17 s per page on CPU.
+// The ONNX hybrid page parser (layout model + PP-OCR) is the default reader for
+// scanned pages and images (~0.5-1.2 s per page). It needs the ONNX Runtime
+// shared library; without it the engine silently falls back to the Granite VLM
+// (GLEANN_DOCLING_VLM=1, 10-17 s per page on CPU) or to "no OCR".
 //
-//	GLEANN_DOCLING_ONNX=1            enable the hybrid parser
+//	GLEANN_DOCLING_ONNX=0            disable the hybrid parser (default: on)
 //	GLEANN_DOCLING_OCR_PROFILE       latin (default, includes Turkish) | chinese
 //	GLEANN_DOCLING_DPI               rasterisation DPI for PDF pages (default 150)
 //	GLEANN_DOCLING_ONNX_DEEP=1       send tables to the VLM (needs GLEANN_DOCLING_VLM=1)
@@ -35,7 +36,8 @@ const (
 	defaultHybridDPI = 150
 )
 
-func onnxEnabled() bool { return envTrue(envONNX) }
+// onnxEnabled is true unless GLEANN_DOCLING_ONNX is explicitly 0/false/no/off.
+func onnxEnabled() bool { return !envExplicitlyDisabled(envONNX) }
 
 func hybridDPI() int {
 	if v, err := strconv.Atoi(os.Getenv(envDPI)); err == nil && v >= 72 && v <= 600 {
@@ -48,6 +50,16 @@ func hybridDPI() int {
 // leaves the engine without it: text layers, Office files and the VLM keep working.
 func (e *EIFDoclingEngine) initHybrid() {
 	if !onnxEnabled() {
+		return
+	}
+	// On by default, so a machine without ONNX Runtime must not download models
+	// or log errors; an explicit GLEANN_DOCLING_ONNX=1 still reports the problem.
+	if _, err := docparser.FindORTLibrary(); err != nil {
+		if envTrue(envONNX) {
+			log.Printf("[docling-onnx] disabled: %v", err)
+		} else {
+			log.Printf("[docling-onnx] ONNX Runtime not found, scanned pages need GLEANN_DOCLING_VLM=1 (install libonnxruntime or set GLEANN_ORT_LIB)")
+		}
 		return
 	}
 	profile, err := docparser.ProfileByName(os.Getenv(envProfile))

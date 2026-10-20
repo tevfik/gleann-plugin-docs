@@ -219,6 +219,16 @@ func (e *EIFDoclingEngine) Close() error {
 func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string, int, error) {
 	ext := strings.ToLower(filepath.Ext(filePath))
 
+	// Legacy binary Office: convert to OOXML, then recurse into the native extractors.
+	if _, legacy := legacyTarget[ext]; legacy {
+		converted, cleanup, err := convertLegacyOffice(ctx, filePath)
+		if err != nil {
+			return "", 0, err
+		}
+		defer cleanup()
+		return e.Convert(ctx, converted)
+	}
+
 	// Plain text / Markdown / CSV / DOCX
 	switch ext {
 	case ".txt", ".md", ".csv", ".json":
@@ -232,13 +242,13 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 		if err != nil {
 			return "", 0, err
 		}
-		return md, 1, nil
+		return e.appendEmbeddedImageText(ctx, md, filePath, "word/media"), 1, nil
 	case ".pptx":
 		md, pages, err := ExtractPPTX(filePath)
 		if err != nil {
 			return "", 0, err
 		}
-		return md, pages, nil
+		return e.appendEmbeddedImageText(ctx, md, filePath, "ppt/media"), pages, nil
 	case ".xlsx":
 		md, sheets, err := ExtractXLSX(filePath)
 		if err != nil {
@@ -257,6 +267,20 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 			return "", 0, err
 		}
 		return md, chapters, nil
+	}
+
+	// TIFF / BMP / WebP: decode in Go, read as PNG.
+	if extraImageExts[ext] {
+		tmp, cleanup, err := toTempPNG(filePath)
+		if err != nil {
+			return "", 0, err
+		}
+		defer cleanup()
+		md, err := e.convertPage(ctx, tmp)
+		if err != nil {
+			return "", 0, err
+		}
+		return md, 1, nil
 	}
 
 	// Images: PNG, JPG, JPEG

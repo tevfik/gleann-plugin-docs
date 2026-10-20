@@ -70,6 +70,7 @@ func TestConvertPDF_PerPageRouting(t *testing.T) {
 }
 
 func TestNewEngine_VLMOptIn(t *testing.T) {
+	t.Setenv(envONNX, "0") // the ONNX reader is on by default; this test is about the VLM alone
 	t.Setenv("GLEANN_DOCLING_VLM", "")
 	t.Setenv("GLEANN_DOCLING_FORCE_VLM", "")
 	eng, err := NewEIFDoclingEngine("/nonexistent.eifm", "")
