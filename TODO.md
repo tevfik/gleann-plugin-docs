@@ -21,7 +21,8 @@
 ## Future Roadmap
 
 - [~] **ONNX backend on ARM64**: works (2026-10-19, 20-core ARM, onnxruntime 1.31 via `GLEANN_ORT_LIB`): ~0.55 s/page on `benchmark_report.pdf` (word recall 98.3%), 1.2 s/page on `academic_paper.pdf` (68.2%, 76.9% after Turkish ASCII folding). Granite-Docling VLM on the same academic paper: ~0.09 recall, ~40 s/page. Decision on default still open. `scanned_report.pdf` scores 0% only because it has no text layer to compare against.
-- [ ] **Granite deep path**: measure `GLEANN_DOCLING_ONNX_DEEP=1`. Before bitllm.c `b94202e` the runtime ignored the prompt (always the page prompt) and forced a 4x3 tile grid, so table crops sent by `eifDeep` were mis-read (FinTabNet cell F1 0.39 -> 0.78 after the fix); re-measure with the new submodule.
+- [x] **ONNX default, legacy Office, TIFF/BMP/WebP, embedded images** (2026-10-19): ONNX page parser on by default (`GLEANN_DOCLING_ONNX=0` to disable), `.doc/.xls/.ppt` via LibreOffice, extra raster formats, text from pictures inside DOCX/PPTX. Open: embedded images are appended, not placed in reading order; EMF/WMF unsupported.
+- [x] **Granite deep path measured** (2026-10-20, bitllm.c cef6d8a): `GLEANN_DOCLING_ONNX_DEEP=1` does not pay off. On the 2-page benchmark report (as images) word recall 0.984 -> 0.989 but precision 0.945 -> 0.654 and 1.5 s -> 10 s: the VLM re-emits the whole page for the table box (duplicated sections), so the box-guided prompt is not honoured. On the dense paper no table is detected, result identical. Stays opt-in, not recommended; fix needs a crop-to-box before the VLM call.
 - [ ] **Better tables and layout for the ONNX path**: a table-structure model instead of the OCR grid, a layout model that knows references, headers and formulas.
 - [ ] **Turkish ı/İ**: normalise or correct the recogniser's dotted/dotless confusion.
 
