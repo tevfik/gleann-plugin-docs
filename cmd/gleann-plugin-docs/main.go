@@ -308,6 +308,14 @@ func runModels(args []string) int {
 		}
 	case "verify":
 		bad := 0
+		if !isVLM {
+			if p, err := docparser.FindORTLibrary(); err != nil {
+				fmt.Printf("FAIL onnxruntime: %v\n", err)
+				bad++
+			} else {
+				fmt.Printf("ok   onnxruntime (%s)\n", p)
+			}
+		}
 		for _, m := range specs {
 			if err := docparser.VerifyModel(targetDir, m); err != nil {
 				fmt.Printf("FAIL %s: %v\n", m.File, err)
