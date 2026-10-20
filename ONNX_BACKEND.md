@@ -47,6 +47,43 @@ GLEANN_DOCLING_ONNX=1 ./bin/gleann-plugin-docs convert scan.pdf
 
 `gleann-plugin-docs models list|verify|download [--profile latin|chinese|all] [--dir DIR]` manages the files.
 
+## Setup screen and config file
+
+`gleann-plugin-docs tui` is an interactive setup in the style of `gleann-plugin-sound tui`: choose the page
+parser, the PP-OCR profile, the Granite VLM and the PDF DPI, see which models are installed, download them
+(SHA-256 checked) and register the plugin in `~/.gleann/plugins.json`. It writes `~/.gleann/docs.json`;
+`GLEANN_DOCS_CONFIG` points elsewhere. Without a terminal use `gleann-plugin-docs config show` and
+`config set <engine|ocr_profile|dpi|vlm|deep_tables|indra_license_accepted> <value>`.
+
+A variable that is set always wins over the file. Engines: `auto` (layout + PP-OCR when installed, the
+default), `paddle` (same, downloads what is missing), `indra`, `off`.
+
+## Indra OCR engine (optional)
+
+[`datalab-to/indra-ocr`](https://huggingface.co/datalab-to/indra-ocr) runs as three ONNX models (line
+detector, CTC recogniser, reading order; 9 MB) straight from Go, with no Python. Select it with
+`engine=indra` in the setup screen or `GLEANN_DOCLING_ONNX_ENGINE=indra`; fetch the models with
+`gleann-plugin-docs models download --indra` (pinned Hugging Face revision, SHA-256 verified).
+
+**License.** The code is Apache-2.0, the weights are under a modified OpenRAIL-M license: free for research,
+personal use and organisations under USD 20M revenue and funding, not for use that competes with Datalab's
+API. That is why the models are never downloaded silently: the setup screen and the command print the notice,
+and the screen asks for a `y`.
+
+Measured on this ARM64 box (3 pages, so a hint, not a benchmark): the Go port matches the Python
+reference (box error <= 0.04 px, identical text and Markdown with the n-gram LM and script routing off).
+Word recall against the PDF text layer, 0.4-0.6 s per page including model load:
+
+| Page | Indra (Go) | layout + PP-OCR |
+| --- | --- | --- |
+| scanned report | 0.989 | 0.989 |
+| Turkish paper, p1 | 0.846 | 0.757 |
+| Turkish paper, p2 | 0.721 | 0.576 |
+
+Not ported: script routing and the CJK/RTL/world recognisers, the n-gram LM beam search, orientation and
+skew correction, and the math and table heads. The model card names Turkish and Czech diacritics as a weak
+spot. Run it on your own pages before making it the default.
+
 ## How it works
 
 ```

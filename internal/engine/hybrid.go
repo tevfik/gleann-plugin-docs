@@ -43,14 +43,15 @@ type pageParser interface {
 //	GLEANN_DOCPARSER_OFFLINE=1       never download missing models
 //	GLEANN_DOCLING_ONNX_ENGINE=indra use Datalab's Indra OCR models instead of layout + PP-OCR
 //	GLEANN_INDRA_MODELS              Indra model directory (default ~/.gleann/models/indra)
+//
+// `gleann-plugin-docs tui` writes the same choices to ~/.gleann/docs.json; variables win over the file.
 const (
-	envEngine   = "GLEANN_DOCLING_ONNX_ENGINE"
-	envIndraDir = "GLEANN_INDRA_MODELS"
-	envONNX     = "GLEANN_DOCLING_ONNX"
-	envProfile  = "GLEANN_DOCLING_OCR_PROFILE"
-	envDPI      = "GLEANN_DOCLING_DPI"
-	envDeep     = "GLEANN_DOCLING_ONNX_DEEP"
-	envOffline  = "GLEANN_DOCPARSER_OFFLINE"
+	envEngine  = "GLEANN_DOCLING_ONNX_ENGINE"
+	envONNX    = "GLEANN_DOCLING_ONNX"
+	envProfile = "GLEANN_DOCLING_OCR_PROFILE"
+	envDPI     = "GLEANN_DOCLING_DPI"
+	envDeep    = "GLEANN_DOCLING_ONNX_DEEP"
+	envOffline = "GLEANN_DOCPARSER_OFFLINE"
 
 	defaultHybridDPI = 150
 )
@@ -127,27 +128,15 @@ func (e *EIFDoclingEngine) initHybrid() {
 	log.Printf("[docling-onnx] ready (profile=%s, %d dpi, deep tables=%v)", profile.Name, hybridDPI(), opts.Deep != nil)
 }
 
-// indraDir is the directory holding det.onnx, rec.onnx, order.onnx and meta.json.
-func indraDir() string {
-	if d := os.Getenv(envIndraDir); d != "" {
-		return d
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".gleann", "models", "indra")
-}
-
 // initIndra starts the Indra OCR parser. The models are not downloaded
 // automatically (their license differs from the code's: read it first); a
 // missing directory or runtime is logged and leaves the engine without it.
 func (e *EIFDoclingEngine) initIndra() {
-	dir := indraDir()
+	dir := indra.ModelDir()
 	threads := min(4, runtime.NumCPU())
 	p, err := indra.NewParser(dir, threads)
 	if err != nil {
-		log.Printf("[docling-indra] disabled: %v (models expected in %s, see %s)", err, dir, envIndraDir)
+		log.Printf("[docling-indra] disabled: %v (models expected in %s, see `gleann-plugin-docs models download --indra`)", err, dir)
 		return
 	}
 	e.hybrid = p

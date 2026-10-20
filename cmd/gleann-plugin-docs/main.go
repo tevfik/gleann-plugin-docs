@@ -12,10 +12,13 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/tevfik/gleann-plugin-docs/internal/config"
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
 	"github.com/tevfik/gleann-plugin-docs/internal/engine"
 	"github.com/tevfik/gleann-plugin-docs/internal/httpserver"
+	"github.com/tevfik/gleann-plugin-docs/internal/indra"
 	"github.com/tevfik/gleann-plugin-docs/internal/parser"
+	"github.com/tevfik/gleann-plugin-docs/internal/tui"
 )
 
 func main() {
@@ -31,7 +34,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --serve [--port 8765] [--model path.eifm]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs convert <document.pdf|png|csv> [--json]\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> [--dir DIR]\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> [--indra|--vlm] [--dir DIR]\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs tui                 interactive setup (writes ~/.gleann/docs.json)\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs config [show|set key value]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --install\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --version\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
@@ -39,6 +44,19 @@ func main() {
 	}
 
 	flag.Parse()
+
+	// ~/.gleann/docs.json (written by `tui`) fills the GLEANN_DOCLING_* variables
+	// that are not set; the setup commands themselves must not depend on it.
+	if len(os.Args) < 2 || (os.Args[1] != "tui" && os.Args[1] != "config") {
+		config.Apply()
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "tui" {
+		os.Exit(runTUI(*portFlag))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "config" {
+		os.Exit(runConfig(os.Args[2:]))
+	}
 
 	if *versionFlag {
 		fmt.Printf("gleann-plugin-docs v%s (schema_version=%d, backend=docling-eif)\n",
@@ -234,8 +252,9 @@ func runModels(args []string) int {
 	dir := fs.String("dir", "", "model directory (default: ~/.gleann/models/docparser, or ~/.gleann/models/granite-docling for --vlm)")
 	profile := fs.String("profile", "", "model set: latin (default), chinese, all, or vlm")
 	vlmFlag := fs.Bool("vlm", false, "manage Granite Docling BitNet VLM model (tevfikk/granite-docling-258M-bitnet)")
+	indraFlag := fs.Bool("indra", false, "manage the Indra OCR models (datalab-to/indra-ocr, own license)")
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs models <download|verify|list> [--vlm] [--profile latin|chinese|all|vlm] [--dir DIR]")
+		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs models <download|verify|list> [--vlm|--indra] [--profile latin|chinese|all|vlm|indra] [--dir DIR]")
 		return 2
 	}
 	action := args[0]
@@ -244,10 +263,13 @@ func runModels(args []string) int {
 	}
 
 	isVLM := *vlmFlag || strings.EqualFold(*profile, "vlm")
+	isIndra := *indraFlag || strings.EqualFold(*profile, "indra")
 
 	targetDir := *dir
 	if targetDir == "" {
-		if isVLM {
+		if isIndra {
+			targetDir = indra.ModelDir()
+		} else if isVLM {
 			targetDir = docparser.VLMModelDir()
 		} else {
 			targetDir = docparser.ModelDir()
@@ -256,7 +278,12 @@ func runModels(args []string) int {
 
 	var specs []docparser.ModelSpec
 	var err error
-	if isVLM {
+	if isIndra {
+		specs = indra.Models()
+		if action == "download" {
+			fmt.Println(indra.License)
+		}
+	} else if isVLM {
 		specs = docparser.VLMModels()
 	} else {
 		specs, err = modelSpecs(*profile)
@@ -323,4 +350,72 @@ func modelSpecs(profile string) ([]docparser.ModelSpec, error) {
 		return nil, err
 	}
 	return docparser.DefaultModels(p), nil
+}
+
+// runTUI opens the setup screen. The Install hook registers the plugin in
+// ~/.gleann/plugins.json like `--install`.
+func runTUI(port int) int {
+	if !isTerminal(os.Stdin) || !isTerminal(os.Stdout) {
+		fmt.Fprintln(os.Stderr, "gleann-plugin-docs tui needs an interactive terminal; use `gleann-plugin-docs config set <key> <value>` instead")
+		return 1
+	}
+	cfg, saved, err := tui.Run(tui.Hooks{Install: func() error { return installPlugin(port) }})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
+		return 1
+	}
+	if saved {
+		fmt.Printf("saved %s (engine=%s, profile=%s, vlm=%v)\n", config.Path(), cfg.Engine, cfg.Profile, cfg.VLM)
+	} else {
+		fmt.Println("not saved")
+	}
+	return 0
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// runConfig is the non-interactive twin of the TUI: show the settings or set one.
+func runConfig(args []string) int {
+	cfg := config.Load()
+	if len(args) == 0 || args[0] == "show" {
+		out, _ := json.MarshalIndent(cfg, "", "  ")
+		fmt.Printf("%s\n%s\n", config.Path(), out)
+		return 0
+	}
+	if args[0] != "set" || len(args) != 3 {
+		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs config [show | set <engine|ocr_profile|dpi|vlm|deep_tables|indra_license_accepted> <value>]")
+		return 2
+	}
+	key, val := args[1], args[2]
+	b := func() bool { v := strings.ToLower(val); return v == "1" || v == "true" || v == "on" || v == "yes" }
+	switch key {
+	case "engine":
+		cfg.Engine = val
+	case "ocr_profile":
+		cfg.Profile = val
+	case "dpi":
+		if _, err := fmt.Sscanf(val, "%d", &cfg.DPI); err != nil {
+			fmt.Fprintf(os.Stderr, "dpi: %v\n", err)
+			return 2
+		}
+	case "vlm":
+		cfg.VLM = b()
+	case "deep_tables":
+		cfg.Deep = b()
+	case "indra_license_accepted":
+		cfg.IndraLicenseAccepted = b()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown key %q\n", key)
+		return 2
+	}
+	cfg.Completed = true
+	if err := config.Save(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	fmt.Printf("%s = %s\n", key, val)
+	return 0
 }
