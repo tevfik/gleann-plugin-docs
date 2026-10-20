@@ -89,8 +89,10 @@ func (e *EIFDoclingEngine) initHybrid() {
 		return
 	}
 	if strings.EqualFold(os.Getenv(envEngine), "indra") {
-		e.initIndra()
-		return
+		if e.initIndra() {
+			return
+		}
+		log.Printf("[docling-indra] falling back to layout + PP-OCR when it is installed")
 	}
 	profile, err := docparser.ProfileByName(os.Getenv(envProfile))
 	if err != nil {
@@ -130,17 +132,19 @@ func (e *EIFDoclingEngine) initHybrid() {
 
 // initIndra starts the Indra OCR parser. The models are not downloaded
 // automatically (their license differs from the code's: read it first); a
-// missing directory or runtime is logged and leaves the engine without it.
-func (e *EIFDoclingEngine) initIndra() {
+// missing directory or runtime is logged and reported as false so that the
+// caller can use the other parser instead of dropping scanned pages.
+func (e *EIFDoclingEngine) initIndra() bool {
 	dir := indra.ModelDir()
 	threads := min(4, runtime.NumCPU())
 	p, err := indra.NewParser(dir, threads)
 	if err != nil {
 		log.Printf("[docling-indra] disabled: %v (models expected in %s, see `gleann-plugin-docs models download --indra`)", err, dir)
-		return
+		return false
 	}
 	e.hybrid = p
 	log.Printf("[docling-indra] ready (%s, %d dpi)", dir, hybridDPI())
+	return true
 }
 
 // canReadScanned reports whether pages without a text layer can be read at all.

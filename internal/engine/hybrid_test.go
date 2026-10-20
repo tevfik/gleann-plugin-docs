@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
+	"github.com/tevfik/gleann-plugin-docs/internal/indra"
 )
 
 func TestHybridAutoStartsOnlyWhenInstalled(t *testing.T) {
@@ -304,5 +305,31 @@ func TestConvertDigitalPDFTableWithHybrid(t *testing.T) {
 	}
 	if strings.Contains(md, "| --- |") {
 		t.Error("without the ONNX parser pages keep the plain text layer")
+	}
+}
+
+// engine=indra with no Indra models must not leave scanned pages unreadable:
+// the layout + PP-OCR parser takes over when it is installed.
+func TestIndraWithoutModelsFallsBackToPaddle(t *testing.T) {
+	if _, err := docparser.FindORTLibrary(); err != nil {
+		t.Skipf("onnxruntime not available: %v", err)
+	}
+	for _, m := range docparser.DefaultModels(docparser.DefaultProfile) {
+		if docparser.VerifyModel(docparser.ModelDir(), m) != nil {
+			t.Skipf("model %s not installed", m.File)
+		}
+	}
+	t.Setenv(envONNX, "")
+	t.Setenv(envEngine, "indra")
+	t.Setenv(envOffline, "1")
+	t.Setenv(indra.ModelDirEnv, t.TempDir()) // no Indra models here
+	t.Setenv("GLEANN_DOCLING_VLM", "0")
+	eng := &EIFDoclingEngine{}
+	eng.initHybrid()
+	if eng.hybrid == nil {
+		t.Fatal("no parser after indra failed; scanned pages would be dropped")
+	}
+	if _, isIndra := eng.hybrid.(*indra.Parser); isIndra {
+		t.Fatal("unexpected indra parser from an empty model dir")
 	}
 }
