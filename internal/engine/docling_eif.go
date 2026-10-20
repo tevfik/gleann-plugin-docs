@@ -123,7 +123,6 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
-	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
 	"github.com/tevfik/gleann-plugin-docs/internal/parser"
 )
 
@@ -134,8 +133,8 @@ type EIFDoclingEngine struct {
 	tokenizerPath string
 	loaded        bool
 	mu            sync.Mutex
-	hybrid        *docparser.Parser // ONNX page parser: table pages of digital PDFs, OCR fallback
-	vlmFailed     bool              // lazy VLM load failed once; do not retry per page
+	hybrid        pageParser // ONNX page parser (docparser or Indra): table pages of digital PDFs, OCR fallback
+	vlmFailed     bool       // lazy VLM load failed once; do not retry per page
 }
 
 // NewEIFDoclingEngine initializes the CGO eif-runtime model engine.

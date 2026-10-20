@@ -122,3 +122,10 @@ func newSingleIOSession(model []byte, intraThreads int) (*ort.DynamicAdvancedSes
 	}
 	return newSession(model, []string{ins[0].Name}, []string{outs[0].Name}, intraThreads)
 }
+
+// NewSession builds a CPU session with explicit input and output names for
+// packages outside docparser (internal/indra). It shares the process-wide
+// runtime environment and the spin-wait setting of the other sessions.
+func NewSession(model []byte, inputs, outputs []string, intraThreads int) (*ort.DynamicAdvancedSession, error) {
+	return newSession(model, inputs, outputs, intraThreads)
+}
