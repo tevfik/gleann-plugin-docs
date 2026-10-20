@@ -17,7 +17,7 @@ import (
 
 const (
 	PluginName    = "gleann-plugin-docs"
-	PluginVersion = "1.3.0"
+	PluginVersion = "1.4.0"
 
 	// TimeoutSec is the per-request HTTP timeout gleann applies to this plugin
 	// (written to plugins.json). OCR of a scanned PDF takes about 1.7 s per page
