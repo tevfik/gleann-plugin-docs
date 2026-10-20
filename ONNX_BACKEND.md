@@ -23,9 +23,12 @@ The backend is **off by default**. Nothing changes for existing users until `GLE
 
 ## Using it
 
-Requirements: `libonnxruntime` (tested with 1.26.0; looked up in `$GLEANN_ORT_LIB`, next to the
+Requirements: `libonnxruntime` (tested with 1.26.0 and 1.31.0; looked up in `$GLEANN_ORT_LIB`, next to the
 executable, `~/.gleann/lib`, then the system library directories) and poppler (`pdftoppm`, already
-required by the plugin).
+required by the plugin). `gleann-plugin-docs models download` installs the runtime too when it is
+missing: the official Microsoft 1.31.0 archive for linux arm64/amd64 or macOS arm64, SHA-256 pinned,
+written to `~/.gleann/lib` (`models download --ort` fetches only the runtime; the setup screen's
+"Download models" does the same). `gleann plugin install docs` runs this step for you.
 
 ```bash
 make download-doc-models            # ~20 MB into ~/.gleann/models/docparser (PROFILE=latin|chinese|all)
@@ -56,7 +59,11 @@ parser, the PP-OCR profile, the Granite VLM and the PDF DPI, see which models ar
 `config set <engine|ocr_profile|dpi|vlm|deep_tables|indra_license_accepted> <value>`.
 
 A variable that is set always wins over the file. Engines: `auto` (layout + PP-OCR when installed, the
-default), `paddle` (same, downloads what is missing), `indra`, `off`.
+default), `paddle` (same, downloads what is missing), `indra`, `off`. `indra` without its models falls
+back to layout + PP-OCR when that is installed, so scanned pages are never silently dropped.
+
+`gleann-plugin-docs --install` registers the plugin with a 900 s request timeout (gleann's default of 120 s
+cut off scanned PDFs of roughly 70 pages at about 1.7 s per page on a 20-core ARM box).
 
 ## Indra OCR engine (optional)
 

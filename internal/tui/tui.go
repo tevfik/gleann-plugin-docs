@@ -22,6 +22,8 @@ type Hooks struct {
 	Install func() error
 	// Download fetches model files into dir (default docparser.EnsureModels).
 	Download func(ctx context.Context, dir string, specs []docparser.ModelSpec) error
+	// InstallORT fetches libonnxruntime when it is missing (default docparser.InstallORT).
+	InstallORT func(ctx context.Context) error
 	// Save persists the config (default config.Save).
 	Save func(*config.Config) error
 }
@@ -71,6 +73,12 @@ func New(cfg *config.Config, h Hooks) Model {
 	if h.Download == nil {
 		h.Download = func(ctx context.Context, dir string, specs []docparser.ModelSpec) error {
 			return docparser.EnsureModels(ctx, dir, specs, nil)
+		}
+	}
+	if h.InstallORT == nil {
+		h.InstallORT = func(ctx context.Context) error {
+			_, err := docparser.InstallORT(ctx, "", nil)
+			return err
 		}
 	}
 	if h.Save == nil {
@@ -270,14 +278,22 @@ func (m Model) startDownload() (tea.Model, tea.Cmd) {
 			todo = append(todo, s)
 		}
 	}
-	if len(todo) == 0 {
+	_, ortErr := docparser.FindORTLibrary()
+	needORT := ortErr != nil && docparser.ORTDownloadSupported()
+	if len(todo) == 0 && !needORT {
 		m.status = "everything is installed"
 		return m, nil
 	}
 	m.busy = true
 	m.status = "downloading..."
 	dl := m.hooks.Download
+	installORT := m.hooks.InstallORT
 	return m, func() tea.Msg {
+		if needORT {
+			if err := installORT(context.Background()); err != nil {
+				return doneMsg{"download of onnxruntime", err}
+			}
+		}
 		for _, s := range todo {
 			if err := dl(context.Background(), s.dir, s.specs); err != nil {
 				return doneMsg{"download of " + s.name, err}
@@ -359,7 +375,7 @@ func (m Model) View() string {
 
 	b.WriteString("\n" + title.Render("Models") + "\n")
 	if _, err := docparser.FindORTLibrary(); err != nil {
-		b.WriteString("  " + warnSt.Render("libonnxruntime not found") + dim.Render(" (set GLEANN_ORT_LIB or put it in ~/.gleann/lib)") + "\n")
+		b.WriteString("  " + warnSt.Render("libonnxruntime not found") + dim.Render(" (press enter on Download models to install it, or set GLEANN_ORT_LIB)") + "\n")
 	} else {
 		b.WriteString("  " + okSt.Render("libonnxruntime ok") + "\n")
 	}

@@ -34,7 +34,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --serve [--port 8765] [--model path.eifm]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs convert <document.pdf|png|csv> [--json]\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> [--indra|--vlm] [--dir DIR]\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> [--indra|--vlm|--ort] [--dir DIR]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs tui                 interactive setup (writes ~/.gleann/docs.json)\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs config [show|set key value]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --install\n")
@@ -227,7 +227,7 @@ func installPlugin(port int) error {
 		Command:       []string{execPath, "--serve", "--port", fmt.Sprintf("%d", port)},
 		Capabilities:  httpserver.Capabilities,
 		Extensions:    httpserver.SupportedExts,
-		Timeout:       120,
+		Timeout:       httpserver.TimeoutSec,
 		Version:       httpserver.PluginVersion,
 		SchemaVersion: httpserver.SchemaVersion,
 		Priority:      10, // Higher priority over python fallbacks
@@ -253,8 +253,9 @@ func runModels(args []string) int {
 	profile := fs.String("profile", "", "model set: latin (default), chinese, all, or vlm")
 	vlmFlag := fs.Bool("vlm", false, "manage Granite Docling BitNet VLM model (tevfikk/granite-docling-258M-bitnet)")
 	indraFlag := fs.Bool("indra", false, "manage the Indra OCR models (datalab-to/indra-ocr, own license)")
+	ortFlag := fs.Bool("ort", false, "only install the ONNX Runtime library into ~/.gleann/lib")
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs models <download|verify|list> [--vlm|--indra] [--profile latin|chinese|all|vlm|indra] [--dir DIR]")
+		fmt.Fprintln(os.Stderr, "usage: gleann-plugin-docs models <download|verify|list> [--vlm|--indra|--ort] [--profile latin|chinese|all|vlm|indra] [--dir DIR]")
 		return 2
 	}
 	action := args[0]
@@ -262,6 +263,9 @@ func runModels(args []string) int {
 		return 2
 	}
 
+	if *ortFlag {
+		return installORTRuntime()
+	}
 	isVLM := *vlmFlag || strings.EqualFold(*profile, "vlm")
 	isIndra := *indraFlag || strings.EqualFold(*profile, "indra")
 
@@ -316,6 +320,12 @@ func runModels(args []string) int {
 			return 1
 		}
 	case "download":
+		if !isVLM {
+			// The ONNX models are useless without the runtime library.
+			if code := installORTRuntime(); code != 0 {
+				return code
+			}
+		}
 		err := docparser.EnsureModels(context.Background(), targetDir, specs, func(s string) { fmt.Println(s) })
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -326,6 +336,17 @@ func runModels(args []string) int {
 		fmt.Fprintf(os.Stderr, "unknown models action %q\n", action)
 		return 2
 	}
+	return 0
+}
+
+// installORTRuntime makes sure libonnxruntime is available (see docparser.InstallORT).
+func installORTRuntime() int {
+	p, err := docparser.InstallORT(context.Background(), "", func(s string) { fmt.Println(s) })
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: onnxruntime: %v\n", err)
+		return 1
+	}
+	fmt.Printf("onnxruntime: %s\n", p)
 	return 0
 }
 

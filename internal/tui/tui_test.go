@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -29,10 +30,11 @@ func key(s string) tea.KeyMsg {
 }
 
 type harness struct {
-	m         Model
-	downloads [][]string // dir, file names per call
-	saved     *config.Config
-	installed int
+	m           Model
+	downloads   [][]string // dir, file names per call
+	saved       *config.Config
+	installed   int
+	ortInstalls int
 }
 
 func newHarness(t *testing.T) *harness {
@@ -51,7 +53,8 @@ func newHarness(t *testing.T) *harness {
 			h.downloads = append(h.downloads, row)
 			return nil
 		},
-		Save: func(c *config.Config) error { cp := *c; h.saved = &cp; return nil },
+		InstallORT: func(context.Context) error { h.ortInstalls++; return nil },
+		Save:       func(c *config.Config) error { cp := *c; h.saved = &cp; return nil },
 	})
 	return h
 }
@@ -178,5 +181,19 @@ func TestInstallHook(t *testing.T) {
 	h.press("down", "down", "down", "down", "down", "down", "enter")
 	if h.installed != 1 {
 		t.Fatalf("install calls = %d", h.installed)
+	}
+}
+
+// A missing libonnxruntime is installed by the same "Download models" step.
+func TestDownloadInstallsMissingRuntime(t *testing.T) {
+	if !docparser.ORTDownloadSupported() {
+		t.Skip("no pinned runtime for this platform")
+	}
+	t.Setenv("GLEANN_ORT_LIB", filepath.Join(t.TempDir(), "absent.so"))
+	h := newHarness(t)
+	h.press("down", "down", "down", "down", "down") // Download models row
+	h.run(h.press("enter"))
+	if h.ortInstalls != 1 {
+		t.Fatalf("runtime installs = %d, want 1", h.ortInstalls)
 	}
 }
