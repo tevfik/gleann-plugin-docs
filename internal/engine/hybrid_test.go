@@ -15,40 +15,72 @@ import (
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
 )
 
-func TestHybridIsOnByDefaultAndCanBeDisabled(t *testing.T) {
+func TestHybridAutoStartsOnlyWhenInstalled(t *testing.T) {
 	t.Setenv(envONNX, "")
-	if !onnxEnabled() {
-		t.Error("the ONNX parser must be on by default")
-	}
-	for _, v := range []string{"0", "false", "no", "off"} {
-		t.Setenv(envONNX, v)
-		if onnxEnabled() {
-			t.Errorf("%s=%s must disable the parser", envONNX, v)
-		}
+	t.Setenv(docparser.ModelDirEnv, t.TempDir()) // nothing installed here
+	t.Setenv("GLEANN_DOCLING_VLM", "0")
+	if onnxEnabled() || onnxDisabled() {
+		t.Error("unset must mean automatic, neither forced on nor off")
 	}
 	eng := &EIFDoclingEngine{}
 	eng.initHybrid()
 	if eng.hybrid != nil || eng.IsAvailable() || eng.canReadScanned() {
-		t.Error("a disabled engine has neither VLM nor OCR")
+		t.Error("with no models installed the engine has neither VLM nor OCR")
 	}
 	if eng.pageDPI() != 150 {
 		t.Errorf("default page DPI = %d, want the VLM's 150", eng.pageDPI())
 	}
 }
 
-// With no ONNX Runtime library on the machine the default-on parser must stay
-// quiet and absent (no model download, no failure).
-func TestDefaultOnWithoutORTLibraryIsNotFatal(t *testing.T) {
-	t.Setenv(envONNX, "")
-	t.Setenv(docparser.LibEnv, filepath.Join(t.TempDir(), "missing.so"))
-	t.Setenv(docparser.ModelDirEnv, t.TempDir())
+func TestHybridExplicitOffWins(t *testing.T) {
+	t.Setenv(envONNX, "0")
+	if !onnxDisabled() {
+		t.Fatal("GLEANN_DOCLING_ONNX=0 must disable the parser")
+	}
 	eng := &EIFDoclingEngine{}
 	eng.initHybrid()
-	if eng.hybrid != nil || eng.canReadScanned() {
-		t.Fatal("no ORT library: parser must be absent")
+	if eng.hybrid != nil {
+		t.Error("parser started although switched off")
 	}
-	if entries, _ := os.ReadDir(docparser.ModelDir()); len(entries) != 0 {
-		t.Errorf("models were downloaded without a usable runtime: %v", entries)
+}
+
+func TestVLMUsable(t *testing.T) {
+	model := filepath.Join(t.TempDir(), "m.eifm")
+	if err := os.WriteFile(model, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		env   string
+		model string
+		want  bool
+	}{
+		{"auto, model present", "", model, true},
+		{"switched off", "0", model, false},
+		{"model missing", "", filepath.Join(t.TempDir(), "none.eifm"), false},
+		{"no model resolved", "", "", false},
+	}
+	for _, c := range cases {
+		t.Setenv("GLEANN_DOCLING_VLM", c.env)
+		eng := &EIFDoclingEngine{modelPath: c.model}
+		if got := eng.vlmUsable(); got != c.want {
+			t.Errorf("%s: vlmUsable = %v, want %v", c.name, got, c.want)
+		}
+	}
+	// A failed lazy load is not retried page after page.
+	t.Setenv("GLEANN_DOCLING_VLM", "")
+	eng := &EIFDoclingEngine{modelPath: model, vlmFailed: true}
+	if eng.vlmUsable() {
+		t.Error("vlmUsable must be false after a failed load")
+	}
+}
+
+func TestVLMPageBudget(t *testing.T) {
+	for in, want := range map[string]int{"": defaultVLMPageBudget, "5": 5, "0": 0, "-1": defaultVLMPageBudget, "x": defaultVLMPageBudget} {
+		t.Setenv("GLEANN_DOCLING_VLM_MAX_PAGES", in)
+		if got := vlmPageBudget(); got != want {
+			t.Errorf("budget(%q) = %d, want %d", in, got, want)
+		}
 	}
 }
 
@@ -119,7 +151,7 @@ func engineWithHybrid(t *testing.T) *EIFDoclingEngine {
 	}
 	t.Setenv(envONNX, "1")
 	t.Setenv(envOffline, "1")
-	t.Setenv("GLEANN_DOCLING_VLM", "")
+	t.Setenv("GLEANN_DOCLING_VLM", "0") // test the OCR path, not whatever VLM is installed
 	t.Setenv("GLEANN_DOCLING_FORCE_VLM", "")
 	eng, err := NewEIFDoclingEngine("", "")
 	if err != nil {
@@ -171,8 +203,8 @@ func TestScannedPDFWithoutOCRStillExplainsItself(t *testing.T) {
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")
 	}
-	t.Setenv(envONNX, "0") // no reader at all: ONNX is on by default
-	t.Setenv("GLEANN_DOCLING_VLM", "")
+	t.Setenv(envONNX, "0")
+	t.Setenv("GLEANN_DOCLING_VLM", "0")
 	t.Setenv("GLEANN_DOCLING_FORCE_VLM", "")
 	pdf := filepath.Join(t.TempDir(), "scanned.pdf")
 	writeImagePDF(t, pdf, fixturePage)
@@ -233,5 +265,44 @@ func writeImagePDF(t *testing.T, path, imagePath string) {
 	fmt.Fprintf(&buf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(offsets)+1, xref)
 	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A digital PDF page with a table: the text stays exact (no OCR errors), and the
+// table becomes Markdown because the layout model finds it. Without the parser
+// the same file yields flat text.
+func TestConvertDigitalPDFTableWithHybrid(t *testing.T) {
+	eng := engineWithHybrid(t)
+	const pdf = "../../testdata/documents/benchmark_report.pdf"
+	md, _, err := eng.Convert(context.Background(), pdf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"| Metric | Description | Target |",
+		"| Section Detection | Known headings found | >= 90% |",
+		"MarkItDown", // exact text layer, not OCR ("MarkltDown")
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("missing %q in:\n%s", want, md)
+		}
+	}
+	if strings.Index(md, "2.2 Metrics Definition") > strings.Index(md, "| Metric |") {
+		t.Error("table must come after its heading")
+	}
+
+	eng.Close()
+	t.Setenv(envONNX, "0")
+	flat, err := NewEIFDoclingEngine("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer flat.Close()
+	md, _, err = flat.Convert(context.Background(), pdf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(md, "| --- |") {
+		t.Error("without the ONNX parser pages keep the plain text layer")
 	}
 }

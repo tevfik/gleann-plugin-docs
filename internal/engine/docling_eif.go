@@ -134,7 +134,8 @@ type EIFDoclingEngine struct {
 	tokenizerPath string
 	loaded        bool
 	mu            sync.Mutex
-	hybrid        *docparser.Parser // optional ONNX page parser (GLEANN_DOCLING_ONNX=1)
+	hybrid        *docparser.Parser // ONNX page parser: table pages of digital PDFs, OCR fallback
+	vlmFailed     bool              // lazy VLM load failed once; do not retry per page
 }
 
 // NewEIFDoclingEngine initializes the CGO eif-runtime model engine.
@@ -148,7 +149,12 @@ func NewEIFDoclingEngine(modelPath, tokenizerPath string) (*EIFDoclingEngine, er
 	defer eng.initHybrid() // after the VLM (if any) is loaded, so the deep path can use it
 
 	if !vlmEnabled() {
-		log.Printf("[docling-eif] VLM disabled (text layer + native Office extractors only); set GLEANN_DOCLING_VLM=1 to enable OCR of scanned pages and images")
+		// Not loaded up front; it is loaded on the first scanned page that needs it.
+		if eng.vlmUsable() {
+			log.Printf("[docling-eif] VLM will load on demand for scanned pages and images (GLEANN_DOCLING_VLM=0 disables it)")
+		} else {
+			log.Printf("[docling-eif] VLM unavailable (disabled or model not found); scanned pages use the ONNX parser if installed")
+		}
 		return eng, nil
 	}
 
@@ -191,9 +197,27 @@ func (e *EIFDoclingEngine) IsAvailable() bool {
 	if e == nil {
 		return false
 	}
+	return e.hybrid != nil || e.vlmUsable()
+}
+
+// vlmUsable reports whether the VLM is loaded or can still be loaded on demand:
+// not switched off with GLEANN_DOCLING_VLM=0, a model file resolved and present,
+// and no earlier load failure.
+func (e *EIFDoclingEngine) vlmUsable() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.loaded || e.hybrid != nil
+	return e.vlmUsableLocked()
+}
+
+func (e *EIFDoclingEngine) vlmUsableLocked() bool {
+	if e.loaded {
+		return true
+	}
+	if e.vlmFailed || envExplicitlyDisabled("GLEANN_DOCLING_VLM") || e.modelPath == "" {
+		return false
+	}
+	_, err := os.Stat(e.modelPath)
+	return err == nil
 }
 
 func (e *EIFDoclingEngine) BackendName() string {
@@ -402,6 +426,18 @@ func (e *EIFDoclingEngine) runVision(imagePath, prompt string) (string, error) {
 // needs before the page is considered "digital" and not in need of OCR/VLM.
 const minPageTextChars = 20
 
+// defaultVLMPageBudget is how many scanned pages of one document the VLM reads
+// before the faster ONNX parser (when installed) takes the rest. Tune with
+// GLEANN_DOCLING_VLM_MAX_PAGES; the VLM costs 10-17 s per page on CPU.
+const defaultVLMPageBudget = 20
+
+func vlmPageBudget() int {
+	if v, err := strconv.Atoi(os.Getenv("GLEANN_DOCLING_VLM_MAX_PAGES")); err == nil && v >= 0 {
+		return v
+	}
+	return defaultVLMPageBudget
+}
+
 // vlmEnabled reports whether the slow Docling VLM may be used. It is opt-in:
 // ~10-17s/page on CPU and unreliable output on Turkish and dense pages, so by
 // default only the text layer and the native Office extractors are used.
@@ -482,9 +518,18 @@ func renderPDFPagesDPI(ctx context.Context, pdfPath string, first, last, dpi int
 	return matches, cleanup, nil
 }
 
-// convertPDF decides per page: pages with a text layer are taken from
-// pdftotext (milliseconds); only pages without one need OCR/VLM. Without the
-// opt-in VLM those pages are skipped with a warning.
+// convertPDF routes every page on its own:
+//
+//   - digital page (text layer): pdftotext is exact and takes milliseconds, but
+//     it flattens tables into one cell per line. When the ONNX parser is
+//     installed the page is rendered and its layout checked; a page with a
+//     table is rebuilt from the layout blocks (tables as Markdown), any other
+//     page keeps the pdftotext text.
+//   - scanned page (no text layer): the Granite-Docling VLM reads it, up to
+//     the per-document page budget; after that, or when the VLM is not
+//     available, the ONNX OCR parser does.
+//
+// A scanned page that nothing can read is skipped with a warning.
 func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (string, int, error) {
 	force := envTrue("GLEANN_DOCLING_FORCE_VLM")
 
@@ -495,42 +540,38 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 	}
 
 	if pages == nil || force {
-		// No usable text layer information: rasterize everything.
+		// No usable text layer information (or forced): rasterize everything.
 		return e.convertPDFAllVLM(ctx, pdfPath)
 	}
 
 	result := make([]string, len(pages))
-	var scanned []int // 0-based indexes of pages without text
-	for i, t := range pages {
-		if nonSpaceChars(t) >= minPageTextChars {
-			result[i] = strings.TrimSpace(t)
-		} else {
-			scanned = append(scanned, i)
-		}
-	}
-
-	if len(scanned) > 0 {
-		if !e.canReadScanned() {
-			log.Printf("[docling-eif] %s: %d of %d page(s) have no text layer and were skipped (OCR/VLM not enabled; set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath), len(scanned), len(pages))
-		} else if e.hybrid == nil && len(scanned) > 1 {
-			// VLM only: render the scanned pages, then pipeline them through the model.
-			var imgs []string
-			var pageIdx []int
-			for _, idx := range scanned {
-				if ctx.Err() != nil {
-					return "", 0, ctx.Err()
-				}
-				r, cleanup, err := renderPDFPagesDPI(ctx, pdfPath, idx+1, idx+1, e.pageDPI())
-				if err != nil {
-					log.Printf("[docling-eif] warning: page %d: %v", idx+1, err)
-					continue
-				}
-				defer cleanup()
-				imgs = append(imgs, r[0])
-				pageIdx = append(pageIdx, idx)
+	var skipped []int
+	vlmPages, budget := 0, vlmPageBudget()
+	done := make([]bool, len(pages))
+	if e.hybrid == nil && e.vlmUsable() {
+		// VLM only: render the scanned pages, then pipeline them through the model.
+		var imgs []string
+		var pageIdx []int
+		for i, t := range pages {
+			if nonSpaceChars(t) >= minPageTextChars {
+				continue
 			}
+			if ctx.Err() != nil {
+				return "", 0, ctx.Err()
+			}
+			r, cleanup, err := renderPDFPagesDPI(ctx, pdfPath, i+1, i+1, e.pageDPI())
+			if err != nil {
+				log.Printf("[docling-eif] warning: page %d: %v", i+1, err)
+				continue
+			}
+			defer cleanup()
+			imgs = append(imgs, r[0])
+			pageIdx = append(pageIdx, i)
+		}
+		if len(imgs) > 1 {
 			mds, errs := e.convertImagesVLM(ctx, imgs)
 			for k, idx := range pageIdx {
+				done[idx] = true
 				if errs[k] != nil {
 					if ctx.Err() != nil {
 						return "", 0, ctx.Err()
@@ -540,25 +581,41 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 				}
 				result[idx] = mds[k]
 			}
-		} else {
-			for _, idx := range scanned {
-				if ctx.Err() != nil {
-					return "", 0, ctx.Err()
-				}
-				imgs, cleanup, err := renderPDFPagesDPI(ctx, pdfPath, idx+1, idx+1, e.pageDPI())
-				if err != nil {
-					log.Printf("[docling-eif] warning: page %d: %v", idx+1, err)
-					continue
-				}
-				md, err := e.convertPage(ctx, imgs[0])
-				cleanup()
-				if err != nil {
-					log.Printf("[docling-eif] warning: failed page %d: %v", idx+1, err)
-					continue
-				}
-				result[idx] = md
-			}
 		}
+	}
+	for i, t := range pages {
+		if err := ctx.Err(); err != nil {
+			return "", 0, err
+		}
+		if done[i] {
+			continue
+		}
+		if nonSpaceChars(t) >= minPageTextChars {
+			result[i] = e.readDigitalPage(ctx, pdfPath, i+1, strings.TrimSpace(t))
+			continue
+		}
+		if !e.canReadScanned() {
+			skipped = append(skipped, i)
+			continue
+		}
+		imgs, cleanup, err := renderPDFPagesDPI(ctx, pdfPath, i+1, i+1, e.pageDPI())
+		if err != nil {
+			log.Printf("[docling-eif] warning: page %d: %v", i+1, err)
+			continue
+		}
+		md, usedVLM, err := e.readScanned(ctx, imgs[0], vlmPages < budget || e.hybrid == nil)
+		cleanup()
+		if usedVLM {
+			vlmPages++
+		}
+		if err != nil {
+			log.Printf("[docling-eif] warning: failed page %d: %v", i+1, err)
+			continue
+		}
+		result[i] = md
+	}
+	if len(skipped) > 0 {
+		log.Printf("[docling-eif] %s: %d of %d page(s) have no text layer and were skipped (no OCR/VLM available; set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath), len(skipped), len(pages))
 	}
 
 	var kept []string
@@ -568,14 +625,47 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 		}
 	}
 	if len(kept) == 0 {
-		return "", 0, fmt.Errorf("no extractable text in %s: scanned PDF and OCR/VLM is not enabled (set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
+		return "", 0, fmt.Errorf("no extractable text in %s: scanned PDF and no OCR/VLM available (set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
 	}
 	return strings.Join(kept, "\n\n"), len(pages), nil
 }
 
+// readDigitalPage returns the Markdown of a page that has a text layer. The
+// text is always the exact pdftotext text. With the ONNX parser installed the
+// layout model also looks for tables; each one is rebuilt as a Markdown table
+// from the positions of its text-layer words (no OCR, so no recognition
+// errors) and spliced into the page at its place. Any failure keeps the plain text.
+func (e *EIFDoclingEngine) readDigitalPage(ctx context.Context, pdfPath string, page int, text string) string {
+	if e.hybrid == nil {
+		return text
+	}
+	imgs, cleanup, err := renderPDFPagesDPI(ctx, pdfPath, page, page, e.pageDPI())
+	if err != nil {
+		return text
+	}
+	defer cleanup()
+	img, err := decodeImage(imgs[0])
+	if err != nil {
+		return text
+	}
+	tables, err := e.hybrid.TableBoxes(img)
+	if err != nil || len(tables) == 0 {
+		return text
+	}
+	bp, err := pdfPageBBox(ctx, pdfPath, page)
+	if err != nil || bp.Width <= 0 {
+		return text
+	}
+	md, ok := spliceTables(bp, float64(img.Bounds().Dx())/bp.Width, tables)
+	if !ok {
+		return text
+	}
+	return md
+}
+
 func (e *EIFDoclingEngine) convertPDFAllVLM(ctx context.Context, pdfPath string) (string, int, error) {
 	if !e.canReadScanned() {
-		return "", 0, fmt.Errorf("cannot read %s: no text layer available and neither OCR nor the VLM is enabled (set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
+		return "", 0, fmt.Errorf("cannot read %s: no text layer available and neither OCR nor the VLM is available (set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
 	}
 
 	imgs, cleanup, err := renderPDFPagesDPI(ctx, pdfPath, 0, 0, e.pageDPI())
@@ -710,13 +800,14 @@ func (e *EIFDoclingEngine) ensureLoadedLocked() error {
 	if e.loaded {
 		return nil
 	}
-	if vlmEnabled() && e.modelPath != "" {
-		if err := e.loadModelLocked(); err != nil {
-			return fmt.Errorf("failed to lazy-load VLM: %w", err)
-		}
-		return nil
+	if !e.vlmUsableLocked() {
+		return fmt.Errorf("image/scanned-page conversion needs OCR or the VLM, and neither is available (set GLEANN_DOCLING_ONNX=1 after `gleann-plugin-docs models download`, or GLEANN_DOCLING_VLM=1 with the VLM model installed)")
 	}
-	return fmt.Errorf("image/scanned-page conversion needs OCR or the VLM, and neither is available (set GLEANN_DOCLING_ONNX=1 after `gleann-plugin-docs models download`, or GLEANN_DOCLING_VLM=1)")
+	if err := e.loadModelLocked(); err != nil {
+		e.vlmFailed = true
+		return fmt.Errorf("failed to lazy-load VLM: %w", err)
+	}
+	return nil
 }
 
 type encodedPage struct {

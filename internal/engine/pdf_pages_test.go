@@ -69,16 +69,16 @@ func TestConvertPDF_PerPageRouting(t *testing.T) {
 	}
 }
 
-func TestNewEngine_VLMOptIn(t *testing.T) {
-	t.Setenv(envONNX, "0") // the ONNX reader is on by default; this test is about the VLM alone
-	t.Setenv("GLEANN_DOCLING_VLM", "")
+func TestNewEngine_VLMNotLoadedUpFront(t *testing.T) {
+	t.Setenv(envONNX, "0")
+	t.Setenv("GLEANN_DOCLING_VLM", "0") // an installed model would otherwise be found by fallback
 	t.Setenv("GLEANN_DOCLING_FORCE_VLM", "")
 	eng, err := NewEIFDoclingEngine("/nonexistent.eifm", "")
 	if err != nil {
 		t.Fatalf("VLM off must not try to load a model: %v", err)
 	}
 	if eng.IsAvailable() {
-		t.Error("model must not be loaded when VLM is disabled")
+		t.Error("model must not be loaded up front, and /nonexistent.eifm cannot be loaded later")
 	}
 	if _, _, err := eng.Convert(context.Background(), "x.png"); err == nil || !strings.Contains(err.Error(), "GLEANN_DOCLING_VLM") {
 		t.Errorf("image without VLM should explain how to enable it, got %v", err)
