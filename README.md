@@ -28,7 +28,7 @@ The plugin acts as a **document structure expert** — like the AST code indexer
 
 1. **Embedded Granite Docling BitNet 1.58-bit VLM ([`tevfikk/granite-docling-258M-bitnet`](https://huggingface.co/tevfikk/granite-docling-258M-bitnet))**: In-process quantized vision-language model for OCR and OTSL (Open Table Structure Language) table layout parsing. Now compressed from 518 MB down to **264 MB** using BitNet ternary weights and INT8 per-row ViT projections in `bitllm.c`. Download with `gleann-plugin-docs models download --vlm` and enable with `GLEANN_DOCLING_VLM=1`.
 2. **Hybrid PDF Fast-Path**: Searchable digital PDFs extract in **~0.05s** via `pdftotext`, while scanned or raster pages are read by the ONNX page parser (default, ~1 s/page) or, when `GLEANN_DOCLING_VLM=1`, by the Docling BitNet VLM.
-3. **Pure Go Office parsers**: DOCX, XLSX, PPTX, HTML, EPUB are read in-process without third-party converters. Legacy `.doc` `.xls` `.ppt` are converted to their OOXML twin by a headless LibreOffice when one is installed. Pictures embedded in DOCX/PPTX are read with the page reader and appended as `## Embedded image: <name>` sections (not at their original position).
+3. **Pure Go Office parsers**: DOCX, XLSX, PPTX, HTML, EPUB are read in-process without third-party converters. Legacy `.xls` is read natively; `.doc` and `.ppt` are converted to their OOXML twin by a headless LibreOffice when one is installed. Pictures embedded in DOCX/PPTX are read with the page reader and appended as `## Embedded image: <name>` sections (not at their original position).
 4. **Hierarchical Graph Generation**: Emits `Document` and nested `Section` nodes with `HAS_SECTION` and `HAS_SUBSECTION` edges ready for Gleann's KùzuDB knowledge graph.
 5. **Table-Aware Extraction**: Tables are cleanly extracted in markdown table syntax, preserving tabular data integrity during chunking. OTSL tables with merged cells (`lcel`, `ucel`, `xcel`) are rendered as HTML tables with `colspan`/`rowspan`.
 6. **ONNX page parser, on by default (CPU, ~0.5–1.2 s/page)**: layout detection + PaddleOCR through ONNX Runtime for scanned pages and images (~23 MB of models, downloaded on first use). Turn it off with `GLEANN_DOCLING_ONNX=0`. Without `libonnxruntime` it stays out of the way (no download, one log line). See [ONNX_BACKEND.md](ONNX_BACKEND.md) for setup, measured accuracy and limits.
@@ -41,7 +41,8 @@ The plugin acts as a **document structure expert** — like the AST code indexer
 |---|---|---|
 | `.pdf` | text layer (`pdftotext`); pages without text go to the page reader | `pdftoppm` for scanned pages |
 | `.docx` `.xlsx` `.pptx` `.html` `.htm` `.epub` `.csv` `.txt` `.md` `.json` | native Go parsers | nothing |
-| `.doc` `.xls` `.ppt` | LibreOffice converts to OOXML, then as above | `soffice` (or `GLEANN_SOFFICE`); otherwise a clear error |
+| `.xls` | native Go BIFF8 reader (values, cached formula results, ISO dates); LibreOffice only as fallback for files it rejects | nothing |
+| `.doc` `.ppt` | LibreOffice converts to OOXML, then as above | `soffice` (or `GLEANN_SOFFICE`); otherwise a clear error |
 | `.png` `.jpg` `.jpeg` `.tif` `.tiff` `.bmp` `.webp` | page reader (ONNX OCR, or the VLM) | `libonnxruntime` or `GLEANN_DOCLING_VLM=1` |
 | pictures inside `.docx` / `.pptx` | page reader, images smaller than 200 px skipped, at most 40 per file | same |
 

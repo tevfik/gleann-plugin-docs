@@ -219,6 +219,15 @@ func (e *EIFDoclingEngine) Close() error {
 func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string, int, error) {
 	ext := strings.ToLower(filepath.Ext(filePath))
 
+	// .xls: read natively; LibreOffice is only the fallback for files the native reader rejects.
+	if ext == ".xls" {
+		if md, sheets, err := ExtractXLS(filePath); err == nil && md != "" {
+			return md, sheets, nil
+		} else if err != nil {
+			log.Printf("[docling-eif] native .xls reader failed (%v), trying LibreOffice", err)
+		}
+	}
+
 	// Legacy binary Office: convert to OOXML, then recurse into the native extractors.
 	if _, legacy := legacyTarget[ext]; legacy {
 		converted, cleanup, err := convertLegacyOffice(ctx, filePath)

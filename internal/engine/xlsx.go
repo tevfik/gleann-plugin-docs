@@ -306,6 +306,11 @@ func parseWorksheet(f *zip.File, sharedStrings []string) (string, error) {
 		return "", nil
 	}
 
+	return rowsToMarkdown(rows), nil
+}
+
+// rowsToMarkdown renders sparse rows as a markdown table whose first row is the header.
+func rowsToMarkdown(rows [][]string) string {
 	width := 0
 	for _, row := range rows {
 		n := len(row)
@@ -336,7 +341,7 @@ func parseWorksheet(f *zip.File, sharedStrings []string) (string, error) {
 		}
 	}
 
-	return sb.String(), nil
+	return sb.String()
 }
 
 func hasContent(row []string) bool {
