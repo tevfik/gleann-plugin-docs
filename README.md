@@ -71,6 +71,17 @@ Done! gleann will automatically detect and manage the plugin whenever document f
 
 ---
 
+## Updating
+
+```bash
+gleann-plugin-docs update --check   # is a newer GitHub release available?
+gleann-plugin-docs update           # download, verify against checksums.txt, replace this binary
+gleann plugin update docs           # the same, driven from gleann
+```
+
+Restart gleann (or `--serve`) afterwards; `update` reports missing OCR files and
+`gleann-plugin-docs models download` fetches them.
+
 ## Usage
 
 ### 1. Automatic with Gleann

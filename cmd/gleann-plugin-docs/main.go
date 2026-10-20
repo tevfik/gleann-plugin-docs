@@ -37,6 +37,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> [--indra|--vlm|--ort] [--dir DIR]\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs tui                 interactive setup (writes ~/.gleann/docs.json)\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs config [show|set key value]\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs update [--check] [--force]   update from the latest GitHub release\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --install\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --version\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
@@ -53,6 +54,9 @@ func main() {
 
 	if len(os.Args) > 1 && os.Args[1] == "tui" {
 		os.Exit(runTUI(*portFlag))
+	}
+	if len(os.Args) > 1 && (os.Args[1] == "update" || os.Args[1] == "upgrade") {
+		os.Exit(runUpdate(os.Args[2:]))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "config" {
 		os.Exit(runConfig(os.Args[2:]))
