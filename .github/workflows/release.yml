@@ -38,6 +38,32 @@ jobs:
       - name: Run Tests
         run: go test -v -race -timeout 5m ./...
 
+  test-arm64:
+    name: Unit & Integration Tests (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential poppler-utils
+
+      - name: Build bitllm.c
+        run: |
+          cmake -B ext/bitllm.c/build -S ext/bitllm.c -DCMAKE_BUILD_TYPE=Release
+          cmake --build ext/bitllm.c/build --target bitllm_static -j$(nproc)
+
+      - name: Run Tests
+        run: go test -count=1 -timeout 10m ./...
+
   build-linux-amd64:
     name: Build Linux AMD64
     needs: test
@@ -73,7 +99,7 @@ jobs:
 
   build-linux-arm64:
     name: Build Linux ARM64
-    needs: test
+    needs: [test, test-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

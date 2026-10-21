@@ -590,7 +590,7 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 			continue
 		}
 		if nonSpaceChars(t) >= minPageTextChars {
-			result[i] = e.readDigitalPage(ctx, pdfPath, i+1, strings.TrimSpace(t))
+			result[i] = promoteNumberedHeadings(e.readDigitalPage(ctx, pdfPath, i+1, strings.TrimSpace(t)))
 			continue
 		}
 		if !e.canReadScanned() {

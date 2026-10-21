@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -30,6 +31,93 @@ func dedupeAdjacentBlocks(s string) string {
 			prev = t
 		}
 		out = append(out, b)
+	}
+	return strings.Join(out, "\n\n")
+}
+
+var headingNumberRe = regexp.MustCompile(`^(\d+(?:\.\d+)*)\.?\s`)
+
+// numberedHeadingLevel returns the Markdown heading prefix implied by a
+// section number ("1." -> "##", "2.1" -> "###"), or "## " when the text is not
+// numbered. Used for <section_header> tags, which carry no level.
+func numberedHeadingLevel(text string) string {
+	return headingPrefix(text, "## ")
+}
+
+// headingPrefix returns the prefix implied by the section number in text, or
+// fallback when the text is not numbered. Models tag every heading with the
+// same level, so the number is the better signal.
+func headingPrefix(text, fallback string) string {
+	m := headingNumberRe.FindStringSubmatch(text)
+	if m == nil {
+		return fallback
+	}
+	depth := strings.Count(m[1], ".") + 1
+	if depth > 4 {
+		depth = 4
+	}
+	return strings.Repeat("#", depth+1) + " "
+}
+
+func wordSet(s string) map[string]struct{} {
+	set := map[string]struct{}{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		set[w] = struct{}{}
+	}
+	return set
+}
+
+// nearDuplicate reports whether two paragraphs share almost all their words
+// (Jaccard >= 0.85, at least 12 words): a VLM re-reading the same region with
+// a slightly different transcription.
+func nearDuplicate(a, b map[string]struct{}) bool {
+	if len(a) < 12 || len(b) < 12 {
+		return false
+	}
+	inter := 0
+	for w := range a {
+		if _, ok := b[w]; ok {
+			inter++
+		}
+	}
+	return float64(inter)/float64(len(a)+len(b)-inter) >= 0.85
+}
+
+// dedupeNearDuplicateParagraphs drops plain paragraphs that near-duplicate an
+// earlier one, together with a heading left orphaned directly above it.
+func dedupeNearDuplicateParagraphs(s string) string {
+	blocks := strings.Split(s, "\n\n")
+	var out []string
+	var seen []map[string]struct{}
+	for _, b := range blocks {
+		t := strings.TrimSpace(b)
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "\x00") ||
+			strings.HasPrefix(t, "|") || strings.HasPrefix(t, "-") || strings.HasPrefix(t, "```") {
+			out = append(out, b)
+			continue
+		}
+		ws := wordSet(t)
+		dup := false
+		for _, prev := range seen {
+			if nearDuplicate(ws, prev) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			seen = append(seen, ws)
+			out = append(out, b)
+			continue
+		}
+		// Drop a heading that now has no body.
+		for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+			out = out[:len(out)-1]
+		}
+		if n := len(out); n > 0 && strings.HasPrefix(strings.TrimSpace(out[n-1]), "#") {
+			out = out[:n-1]
+		}
 	}
 	return strings.Join(out, "\n\n")
 }
@@ -65,6 +153,7 @@ func DocTagsToMarkdown(doctags string) string {
 	// (<page_header>, a dangling "<text>" when generation stopped early, ...)
 	cleaned = leftoverTagRe.ReplaceAllString(cleaned, "")
 	cleaned = dedupeAdjacentBlocks(cleaned)
+	cleaned = dedupeNearDuplicateParagraphs(cleaned)
 
 	// 6. Final clean up
 	cleaned = trailingSpace.ReplaceAllString(cleaned, "\n")
@@ -206,23 +295,23 @@ func convertHeadingsAndBlocks(text string) string {
 	})
 
 	text = regexp.MustCompile(`(?s)<section_header_level_1>(.*?)</section_header_level_1>`).ReplaceAllStringFunc(text, func(m string) string {
-		inner := strings.TrimSpace(m[24 : len(m)-25])
-		return "\n\n## " + stripRemainingTags(inner) + "\n\n"
+		inner := stripRemainingTags(strings.TrimSpace(m[24 : len(m)-25]))
+		return "\n\n" + headingPrefix(inner, "## ") + inner + "\n\n"
 	})
 
 	text = regexp.MustCompile(`(?s)<section_header_level_2>(.*?)</section_header_level_2>`).ReplaceAllStringFunc(text, func(m string) string {
-		inner := strings.TrimSpace(m[24 : len(m)-25])
-		return "\n\n### " + stripRemainingTags(inner) + "\n\n"
+		inner := stripRemainingTags(strings.TrimSpace(m[24 : len(m)-25]))
+		return "\n\n" + headingPrefix(inner, "### ") + inner + "\n\n"
 	})
 
 	text = regexp.MustCompile(`(?s)<section_header_level_3>(.*?)</section_header_level_3>`).ReplaceAllStringFunc(text, func(m string) string {
-		inner := strings.TrimSpace(m[24 : len(m)-25])
-		return "\n\n#### " + stripRemainingTags(inner) + "\n\n"
+		inner := stripRemainingTags(strings.TrimSpace(m[24 : len(m)-25]))
+		return "\n\n" + headingPrefix(inner, "#### ") + inner + "\n\n"
 	})
 
 	text = regexp.MustCompile(`(?s)<section_header>(.*?)</section_header>`).ReplaceAllStringFunc(text, func(m string) string {
-		inner := strings.TrimSpace(m[16 : len(m)-17])
-		return "\n\n## " + stripRemainingTags(inner) + "\n\n"
+		inner := stripRemainingTags(strings.TrimSpace(m[16 : len(m)-17]))
+		return "\n\n" + numberedHeadingLevel(inner) + inner + "\n\n"
 	})
 
 	// Code blocks

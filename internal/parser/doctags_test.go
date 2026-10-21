@@ -91,3 +91,37 @@ func TestDocTagsToMarkdown_CodeAndLists(t *testing.T) {
 		t.Errorf("list items missing: %s", got)
 	}
 }
+
+func TestDocTagsToMarkdown_NearDuplicateSectionDropped(t *testing.T) {
+	in := "<doctag><section_header>2.1 Test Corpus</section_header><text>The test corpus consists of documents with known structure: headings at multiple levels, paragraphs with technical content, tables with numerical data, and inline formatting.</text>" +
+		"<section_header>1. Introduction</section_header><text>The test corpus consists of documents with knowledge structure: headings at multiple levels, paragraphs with technical content, tables with numerical data, and inline formatting.</text>" +
+		"<section_header>2.2 Metrics</section_header><text>We measure detection.</text></doctag>"
+	got := DocTagsToMarkdown(in)
+	if strings.Count(got, "test corpus consists") != 1 {
+		t.Fatalf("near-duplicate paragraph kept:\n%s", got)
+	}
+	if strings.Contains(got, "1. Introduction") {
+		t.Fatalf("orphan heading kept:\n%s", got)
+	}
+	if !strings.Contains(got, "### 2.1 Test Corpus") || !strings.Contains(got, "### 2.2 Metrics") {
+		t.Fatalf("numbered headings should be level 3:\n%s", got)
+	}
+}
+
+func TestNumberedHeadingLevel(t *testing.T) {
+	for in, want := range map[string]string{"1. Intro": "## ", "2.1 Corpus": "### ", "3.2.1 X": "#### ", "Abstract": "## ", "2024 results": "## "} {
+		if got := numberedHeadingLevel(in); got != want {
+			t.Errorf("%q = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDocTagsToMarkdown_NumberOverridesTaggedLevel(t *testing.T) {
+	in := "<section_header_level_1>2. Methodology</section_header_level_1><section_header_level_1>2.1 Test Corpus</section_header_level_1><section_header_level_1>Appendix</section_header_level_1>"
+	got := DocTagsToMarkdown(in)
+	for _, want := range []string{"## 2. Methodology", "### 2.1 Test Corpus", "## Appendix"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %q", want, got)
+		}
+	}
+}
