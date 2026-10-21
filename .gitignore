@@ -10,7 +10,7 @@ __pycache__/
 
 # Binaries
 bin/
-gleann-plugin-docs
+/gleann-plugin-docs
 *.log
 
 # OS generated files
