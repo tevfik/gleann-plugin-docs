@@ -165,3 +165,20 @@ Figure details`
 		t.Errorf("expected 1 HAS_SUBSECTION edge attaching Figure to Section, got %d", len(hasSub))
 	}
 }
+
+func TestParseDocument_KeepsTextBeforeFirstHeading(t *testing.T) {
+	md := "Title Page\nRevision 1.00 June 26, 2026\n\n## 1 Overview\n\nBody."
+	res := ParseDocument(md, "d.pdf", "pdf", 1)
+	var pre, body bool
+	for _, n := range res.Nodes {
+		if n.Type != "Section" {
+			continue
+		}
+		c, _ := n.Data["content"].(string)
+		pre = pre || strings.Contains(c, "Revision 1.00")
+		body = body || strings.Contains(c, "Body.")
+	}
+	if !pre || !body {
+		t.Fatalf("preamble kept=%v body kept=%v", pre, body)
+	}
+}

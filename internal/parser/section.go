@@ -133,6 +133,25 @@ func ParseDocument(markdown, sourcePath, docFormat string, pageCount int) *Plugi
 	var parentStack []stackItem
 	childCounters := make(map[string]int)
 
+	// Text before the first heading (title page, abstract, revision table)
+	// belongs to the document; keep it as a level-0 section instead of
+	// dropping it.
+	if pre := strings.TrimSpace(strings.Join(lines[:headings[0].lineIdx], "\n")); pre != "" {
+		preID := secID(sourcePath, "pre")
+		nodes = append(nodes, Node{
+			Type: "Section",
+			Data: map[string]any{
+				"id":       preID,
+				"heading":  docTitle,
+				"level":    0,
+				"content":  pre,
+				"summary":  extractSummary(pre, 200),
+				"doc_path": sourcePath,
+			},
+		})
+		edges = append(edges, Edge{Type: "HAS_SECTION", From: sourcePath, To: preID})
+	}
+
 	for idx, h := range headings {
 		contentStart := h.lineIdx + 1
 		contentEnd := len(lines)

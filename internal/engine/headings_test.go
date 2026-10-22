@@ -24,3 +24,17 @@ func TestPromoteNumberedHeadings_LeavesListsAndProse(t *testing.T) {
 		t.Fatalf("unexpected promotion:\n%s", got)
 	}
 }
+
+func TestPromoteNumberedHeadings_SkipsQuantities(t *testing.T) {
+	in := "Toplam PSRAM\n\n14 KB\n\n4 KB\n\n2 MHz\n\n3 V\n\nSon.\n"
+	if got := promoteNumberedHeadings(in); got != in {
+		t.Fatalf("quantities promoted to headings:\n%s", got)
+	}
+}
+
+func TestPromoteNumberedHeadings_SkipsTOCEntries(t *testing.T) {
+	in := "Contents\n\n1 Overview ........................ 4\n\n2.1 Specs . . . . . . . . 5\n\nBody.\n"
+	if got := promoteNumberedHeadings(in); got != in {
+		t.Fatalf("TOC entries promoted:\n%s", got)
+	}
+}
