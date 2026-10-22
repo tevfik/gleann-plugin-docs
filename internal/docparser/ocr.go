@@ -15,12 +15,15 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
-// PP-OCRv4 parameters (RapidOCR defaults).
+// PP-OCR parameters. The detector values are looser than the RapidOCR
+// defaults (960 / 0.3 / 0.5 / 1.6): on a noisy, tightly spaced scan those
+// found only the short last line of each paragraph (about 10% of the text),
+// while these recover it and do not hurt clean pages (see docparser-bench).
 const (
-	detMaxSide   = 960  // longest side after resizing
-	detThresh    = 0.3  // probability map binarisation
-	detBoxThresh = 0.5  // minimum mean probability of a box
-	detUnclip    = 1.6  // box growth factor (DB "unclip ratio")
+	detMaxSide   = 1600 // longest side after resizing
+	detThresh    = 0.15 // probability map binarisation
+	detBoxThresh = 0.3  // minimum mean probability of a box
+	detUnclip    = 1.2  // box growth factor (DB "unclip ratio")
 	detMinSide   = 3    // boxes thinner than this are noise
 	detPad       = 10   // white margin added around a block before detection
 	recHeight    = 48   // line crops are scaled to this height

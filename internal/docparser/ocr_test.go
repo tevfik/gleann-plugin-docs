@@ -21,7 +21,7 @@ func TestDBBoxes(t *testing.T) {
 	b := image.Rect(10, 50, 60, 60)
 	paint(m, w, a, 0.9)                           // text line
 	paint(m, w, b, 0.9)                           // a second one
-	paint(m, w, image.Rect(70, 10, 90, 20), 0.35) // above the binarisation threshold, below the box score
+	paint(m, w, image.Rect(70, 10, 90, 20), 0.2) // above the binarisation threshold, below the box score
 	paint(m, w, image.Rect(70, 40, 95, 41), 0.95) // one pixel thin: noise
 
 	got := dbBoxes(m, w, h, OCROptions{}.withDefaults())
