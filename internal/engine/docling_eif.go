@@ -426,9 +426,12 @@ func (e *EIFDoclingEngine) runVision(imagePath, prompt string) (string, error) {
 const minPageTextChars = 20
 
 // defaultVLMPageBudget is how many scanned pages of one document the VLM reads
-// before the faster ONNX parser (when installed) takes the rest. Tune with
-// GLEANN_DOCLING_VLM_MAX_PAGES; the VLM costs 10-17 s per page on CPU.
-const defaultVLMPageBudget = 20
+// before the faster ONNX parser (when installed) takes the rest. It is 0: on a
+// 4-page scanned English paper the ONNX parser recovered 99% of the words in
+// ~3 s/page while the VLM looped and returned almost nothing in ~30 s/page, so
+// the VLM only runs when the ONNX parser is missing or the budget is raised
+// with GLEANN_DOCLING_VLM_MAX_PAGES.
+const defaultVLMPageBudget = 0
 
 func vlmPageBudget() int {
 	if v, err := strconv.Atoi(os.Getenv("GLEANN_DOCLING_VLM_MAX_PAGES")); err == nil && v >= 0 {
