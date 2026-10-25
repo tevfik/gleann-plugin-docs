@@ -6,10 +6,11 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/tevfik/gleann-plugin-docs/internal/config"
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
@@ -26,6 +27,8 @@ type Hooks struct {
 	InstallORT func(ctx context.Context) error
 	// Save persists the config (default config.Save).
 	Save func(*config.Config) error
+	// Update checks for and installs the latest release.
+	Update func() error
 }
 
 type item int
@@ -38,6 +41,7 @@ const (
 	itemDPI
 	itemModels
 	itemInstall
+	itemUpdate
 	itemSave
 	itemCount
 )
@@ -163,6 +167,8 @@ func (m Model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.status = "registered in ~/.gleann/plugins.json"
 			}
+		case itemUpdate:
+			return m.updatePlugin()
 		case itemSave:
 			return m.save()
 		default:
@@ -170,6 +176,19 @@ func (m Model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m Model) updatePlugin() (tea.Model, tea.Cmd) {
+	if m.hooks.Update == nil {
+		m.status = "update not configured"
+		return m, nil
+	}
+	m.busy = true
+	m.status = "checking and installing update..."
+	return m, func() tea.Msg {
+		err := m.hooks.Update()
+		return doneMsg{what: "update", err: err}
+	}
 }
 
 // change steps the value under the cursor.
@@ -303,19 +322,87 @@ func (m Model) startDownload() (tea.Model, tea.Cmd) {
 	}
 }
 
-var (
-	title  = lipgloss.NewStyle().Bold(true)
-	dim    = lipgloss.NewStyle().Faint(true)
-	sel    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	okSt   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	warnSt = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-)
-
 func onOff(b bool) string {
 	if b {
 		return "on"
 	}
 	return "off"
+}
+
+type itemMeta struct {
+	icon  string
+	title string
+	value string
+	desc  string
+}
+
+func (m Model) itemsMeta() [itemCount]itemMeta {
+	dpi := m.cfg.DPI
+	if dpi == 0 {
+		dpi = 150
+	}
+	deepVal := onOff(m.cfg.Deep)
+	deepDesc := "Table extraction with cell-level bounding boxes"
+	if !m.cfg.VLM {
+		deepVal = "off"
+		deepDesc = "Table structure extraction (requires Granite VLM)"
+	}
+	return [itemCount]itemMeta{
+		itemEngine: {
+			icon:  "⚙ ",
+			title: "Page Parser",
+			value: m.cfg.Engine,
+			desc:  engineHint(m.cfg.Engine),
+		},
+		itemProfile: {
+			icon:  "🔤",
+			title: "PP-OCR Profile",
+			value: m.cfg.Profile,
+			desc:  "Target language/character set (latin, cyrillic, devanagari)",
+		},
+		itemVLM: {
+			icon:  "👁 ",
+			title: "Granite VLM",
+			value: onOff(m.cfg.VLM),
+			desc:  "Visual language model for dense complex pages & layouts",
+		},
+		itemDeep: {
+			icon:  "📊",
+			title: "Deep Tables",
+			value: deepVal,
+			desc:  deepDesc,
+		},
+		itemDPI: {
+			icon:  "🔍",
+			title: "PDF Page DPI",
+			value: fmt.Sprintf("%d dpi", dpi),
+			desc:  "Rasterization resolution (150 = fast, 200 = balanced, 300 = crisp)",
+		},
+		itemModels: {
+			icon:  "⬇ ",
+			title: "Download Models",
+			value: "enter to fetch",
+			desc:  "Verify & download missing ONNX/VLM model weights",
+		},
+		itemInstall: {
+			icon:  "🔌",
+			title: "Register in Gleann",
+			value: "enter to register",
+			desc:  "Save capability registration to ~/.gleann/plugins.json",
+		},
+		itemUpdate: {
+			icon:  "⬆ ",
+			title: "Update Plugin",
+			value: "enter to update",
+			desc:  "Check for and install latest release from GitHub",
+		},
+		itemSave: {
+			icon:  "💾",
+			title: "Save and Quit",
+			value: "enter or 's'",
+			desc:  "Persist settings to ~/.gleann/docs.json and exit",
+		},
+	}
 }
 
 func (m Model) rows() [itemCount][2]string {
@@ -335,6 +422,7 @@ func (m Model) rows() [itemCount][2]string {
 		itemDPI:     {"PDF page DPI", fmt.Sprint(dpi)},
 		itemModels:  {"Download models", "enter"},
 		itemInstall: {"Register in gleann", "enter"},
+		itemUpdate:  {"Update plugin", "enter"},
 		itemSave:    {"Save and quit", "enter  (or s)"},
 	}
 }
@@ -342,59 +430,76 @@ func (m Model) rows() [itemCount][2]string {
 func engineHint(e string) string {
 	switch e {
 	case config.EngineAuto:
-		return dim.Render("layout + PP-OCR when installed")
+		return "layout + PP-OCR when installed"
 	case config.EnginePaddle:
-		return dim.Render("layout + PP-OCR, downloads what is missing")
+		return "layout + PP-OCR, downloads what is missing"
 	case config.EngineIndra:
-		return dim.Render("Indra OCR, CPU, ~0.5 s/page; weights have their own license")
+		return "Indra OCR, CPU, ~0.5 s/page; weights have their own license"
 	case config.EngineOff:
-		return dim.Render("text layers and Office files only")
+		return "text layers and Office files only"
 	}
 	return ""
 }
 
 func (m Model) View() string {
 	var b strings.Builder
-	b.WriteString(title.Render("gleann-plugin-docs setup") + "  " + dim.Render(config.Path()) + "\n\n")
+	b.WriteString(Logo())
+	b.WriteString("\n")
+	b.WriteString(SubtitleStyle.Render("  Local document extraction & OCR companion for gleann"))
+	b.WriteString("\n")
+	b.WriteString(DescStyle.Render("  Config: " + config.Path()))
+	b.WriteString("\n\n")
 
 	if m.mode == modeLicense {
-		b.WriteString(warnSt.Render("License check") + "\n\n" + wrap(indra.License, 76) + "\n\n")
-		b.WriteString("Download the Indra models (~9 MB)? [y/N] ")
+		b.WriteString(WarnBadge.Render("  ⚠ License Confirmation (Indra Models)") + "\n\n")
+		b.WriteString("  " + wrap(indra.License, 76) + "\n\n")
+		b.WriteString("  Download the Indra models (~9 MB)? [y/N] ")
 		return b.String()
 	}
 
-	rows := m.rows()
-	for i, r := range rows {
-		line := fmt.Sprintf("%-20s %s", r[0], r[1])
-		if item(i) == m.cursor {
-			b.WriteString(sel.Render("> "+line) + "\n")
+	items := m.itemsMeta()
+	for i, it := range items {
+		active := item(i) == m.cursor
+		if active {
+			b.WriteString(ActiveItemStyle.Render(fmt.Sprintf("▸ %s %-18s %s", it.icon, it.title, ValueBadgeActive.Render("["+it.value+"]"))))
+			b.WriteString("\n")
+			b.WriteString(ActiveDescStyle.Render(fmt.Sprintf("  %s", it.desc)))
+			b.WriteString("\n")
 		} else {
-			b.WriteString("  " + line + "\n")
+			b.WriteString(NormalItemStyle.Render(fmt.Sprintf("  %s %-18s %s", it.icon, it.title, ValueBadgeNormal.Render("["+it.value+"]"))))
+			b.WriteString("\n")
+			b.WriteString(DescStyle.Render(fmt.Sprintf("  %s", it.desc)))
+			b.WriteString("\n")
 		}
 	}
 
-	b.WriteString("\n" + title.Render("Models") + "\n")
+	b.WriteString("\n")
+	b.WriteString(SectionHeaderStyle.Render("  📦 Installed Models & Runtime"))
+	b.WriteString("\n")
+
 	if _, err := docparser.FindORTLibrary(); err != nil {
-		b.WriteString("  " + warnSt.Render("libonnxruntime not found") + dim.Render(" (press enter on Download models to install it, or set GLEANN_ORT_LIB)") + "\n")
+		b.WriteString("  " + WarnBadge.Render("⚠ missing ") + "libonnxruntime" + DescStyle.Render(" (press enter on Download models or set GLEANN_ORT_LIB)") + "\n")
 	} else {
-		b.WriteString("  " + okSt.Render("libonnxruntime ok") + "\n")
+		b.WriteString("  " + SuccessBadge.Render("✓ ok      ") + "libonnxruntime runtime active\n")
 	}
+
 	sets := m.sets()
 	if len(sets) == 0 {
-		b.WriteString("  " + dim.Render("no model needed") + "\n")
+		b.WriteString("  " + DescStyle.Render("no additional models needed for current engine") + "\n")
 	}
 	for _, s := range sets {
 		if n, bytes := s.missing(); n == 0 {
-			b.WriteString("  " + okSt.Render("ok      ") + s.name + "\n")
+			b.WriteString("  " + SuccessBadge.Render("✓ ok      ") + s.name + "\n")
 		} else {
-			b.WriteString("  " + warnSt.Render(fmt.Sprintf("missing ")) + fmt.Sprintf("%s (%d files, %.1f MB)", s.name, n, float64(bytes)/1e6) + "\n")
+			b.WriteString("  " + WarnBadge.Render("⚠ missing ") + fmt.Sprintf("%-28s (%d files, %.1f MB)", s.name, n, float64(bytes)/1e6) + "\n")
 		}
 	}
 
 	if m.status != "" {
-		b.WriteString("\n" + m.status + "\n")
+		b.WriteString("\n  " + ActiveDescStyle.Render("ℹ "+m.status) + "\n")
 	}
-	b.WriteString("\n" + dim.Render("up/down move · left/right change · enter run · s save · q quit without saving") + "\n")
+
+	b.WriteString("\n" + StatusBarStyle.Render("  ↑/↓ move · ←/→ adjust · enter select · s save · q quit without saving") + "\n")
 	return b.String()
 }
 
@@ -421,4 +526,107 @@ func Run(h Hooks) (*config.Config, bool, error) {
 	}
 	m := final.(Model)
 	return m.Config(), m.Saved(), nil
+}
+
+// RunApp starts the full interactive TUI application loop with the home menu.
+func RunApp(port int) error {
+	for {
+		home := NewHomeModel()
+		p := tea.NewProgram(home, tea.WithAltScreen())
+		result, err := p.Run()
+		if err != nil {
+			return fmt.Errorf("home screen: %w", err)
+		}
+		h := result.(HomeModel)
+		if h.Quitting() {
+			return nil
+		}
+
+		switch h.Chosen() {
+		case ScreenSetup:
+			if err := runSetupWizard(port); err != nil {
+				return err
+			}
+		case ScreenConvert:
+			runCLIMode("convert")
+		case ScreenServe:
+			runServeToggle(port)
+		case ScreenModels:
+			runCLIMode("models", "verify")
+		case ScreenUpdate:
+			runSubcommand("update")
+		case ScreenInstall:
+			runSubcommand("install")
+		case ScreenUninstall:
+			runSubcommand("uninstall")
+		}
+	}
+}
+
+func runSetupWizard(port int) error {
+	cfg := config.Load()
+	h := Hooks{
+		Install: func() error {
+			runSubcommand("install")
+			return nil
+		},
+		Update: func() error {
+			runSubcommand("update")
+			return nil
+		},
+	}
+	m := New(cfg, h)
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	result, err := p.Run()
+	if err != nil {
+		return fmt.Errorf("setup: %w", err)
+	}
+	sm := result.(Model)
+	if sm.Saved() {
+		_ = config.Save(sm.Config())
+	}
+	return nil
+}
+
+func runSubcommand(args ...string) {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "\n%v\n", err)
+	}
+	fmt.Println("\nPress enter to return to menu...")
+	buf := make([]byte, 1)
+	_, _ = os.Stdin.Read(buf)
+}
+
+func runCLIMode(mode string, extraArgs ...string) {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	var args []string
+	if mode == "convert" {
+		fmt.Print("Enter document file path to convert: ")
+		var path string
+		_, _ = fmt.Scanln(&path)
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		args = []string{"convert", path}
+	} else {
+		args = append([]string{mode}, extraArgs...)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	_ = cmd.Run()
+	fmt.Println("\nPress enter to return to menu...")
+	buf := make([]byte, 1)
+	_, _ = os.Stdin.Read(buf)
 }

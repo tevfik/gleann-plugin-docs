@@ -62,10 +62,36 @@ bench-engine:
 test-all:
 	go test -v ./...
 
-install: build
+INSTALL_DIR  ?= /usr/local/bin
+USER_BIN_DIR ?= $(HOME)/.local/bin
+
+# register — add the plugin to ~/.gleann/plugins.json (uses the binary's own path)
+register: build
 	./$(BIN_DIR)/$(BINARY_NAME) --install
+
+# install-user — build, install to ~/.local/bin (no sudo) and register
+# (written to a temp name and renamed so a running server does not block it)
+install-user: build
+	@mkdir -p $(USER_BIN_DIR)
+	install -m 0755 $(BIN_DIR)/$(BINARY_NAME) $(USER_BIN_DIR)/$(BINARY_NAME).new
+	mv -f $(USER_BIN_DIR)/$(BINARY_NAME).new $(USER_BIN_DIR)/$(BINARY_NAME)
+	$(USER_BIN_DIR)/$(BINARY_NAME) --install
+	@echo "✅ Installed $(BINARY_NAME) → $(USER_BIN_DIR)/$(BINARY_NAME)"
+
+# install — system-wide to /usr/local/bin (needs sudo) and register
+install: build
+	sudo install -m 0755 $(BIN_DIR)/$(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME).new
+	sudo mv -f $(INSTALL_DIR)/$(BINARY_NAME).new $(INSTALL_DIR)/$(BINARY_NAME)
+	$(INSTALL_DIR)/$(BINARY_NAME) --install
+	@echo "✅ Installed $(BINARY_NAME) → $(INSTALL_DIR)/$(BINARY_NAME)"
+
+# uninstall — remove the plugin registration and both binaries
+uninstall:
+	-$(BIN_DIR)/$(BINARY_NAME) uninstall
+	rm -f $(USER_BIN_DIR)/$(BINARY_NAME)
+	@if [ -f $(INSTALL_DIR)/$(BINARY_NAME) ]; then sudo rm -f $(INSTALL_DIR)/$(BINARY_NAME); fi
 
 clean:
 	rm -rf $(BIN_DIR)
 
-.PHONY: all build test test-all install clean download-doc-models verify-doc-models build-embedded bench-docparser bench bench-engine
+.PHONY: all build test test-all register install install-user uninstall clean download-doc-models verify-doc-models build-embedded bench-docparser bench bench-engine

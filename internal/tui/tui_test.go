@@ -197,3 +197,24 @@ func TestDownloadInstallsMissingRuntime(t *testing.T) {
 		t.Fatalf("runtime installs = %d, want 1", h.ortInstalls)
 	}
 }
+
+func TestViewBrandingAndAppearance(t *testing.T) {
+	h := newHarness(t)
+	v := h.m.View()
+	// Should show Logo/Banner characters
+	if !strings.Contains(v, "╔═╗") {
+		t.Error("View does not contain Gleann ASCII logo")
+	}
+	// Should show subtitle
+	if !strings.Contains(v, "Local document extraction & OCR companion for gleann") {
+		t.Error("View does not contain companion subtitle")
+	}
+	// Should show active arrow indicator
+	if !strings.Contains(v, "▸") {
+		t.Error("View does not contain active arrow indicator ▸")
+	}
+	// Should show icons
+	if !strings.Contains(v, "Page Parser") || !strings.Contains(v, "Granite VLM") {
+		t.Error("View does not contain expected menu item titles")
+	}
+}

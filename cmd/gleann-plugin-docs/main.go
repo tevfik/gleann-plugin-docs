@@ -32,14 +32,16 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "gleann-plugin-docs: High-performance Go/C Document Intelligence Plugin\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --serve [--port 8765] [--model path.eifm]\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs convert <document.pdf|png|csv> [--json]\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> [--indra|--vlm|--ort] [--dir DIR]\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs tui                 interactive setup (writes ~/.gleann/docs.json)\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs config [show|set key value]\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs tui                          interactive menu & setup\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs convert <document> [--json]  convert document to markdown or JSON\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs serve [--port 8765]          run HTTP plugin daemon for gleann\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs serve enable|disable|status  background server that starts at login\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs models <download|verify|list> manage OCR & VLM model weights\n")
 		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs update [--check] [--force]   update from the latest GitHub release\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --install\n")
-		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs --version\n\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs install                      register plugin in ~/.gleann/plugins.json\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs uninstall                    remove plugin from ~/.gleann/plugins.json\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs config [show|set key value]  read or set configuration key\n")
+		fmt.Fprintf(os.Stderr, "  gleann-plugin-docs version                      show plugin version and exit\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -60,6 +62,45 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "config" {
 		os.Exit(runConfig(os.Args[2:]))
+	}
+	if len(os.Args) > 2 && (os.Args[1] == "serve" || os.Args[1] == "plugin-serve") {
+		switch os.Args[2] {
+		case "enable":
+			if err := tui.EnableServe(tui.ServeArgs(*portFlag)); err != nil {
+				log.Fatalf("enable failed: %v", err)
+			}
+			fmt.Printf("Plugin server enabled on :%d (starts at login).\n", *portFlag)
+			return
+		case "disable":
+			if err := tui.DisableServe(); err != nil {
+				log.Fatalf("disable failed: %v", err)
+			}
+			fmt.Println("Plugin server disabled.")
+			return
+		case "status":
+			if tui.ServeEnabled() {
+				fmt.Println("enabled")
+				return
+			}
+			fmt.Println("disabled")
+			os.Exit(1)
+		}
+	}
+	if len(os.Args) > 1 && (os.Args[1] == "serve" || os.Args[1] == "plugin-serve") {
+		*serveFlag = true
+	}
+	if len(os.Args) > 1 && os.Args[1] == "install" {
+		*installFlag = true
+	}
+	if len(os.Args) > 1 && (os.Args[1] == "uninstall" || os.Args[1] == "--uninstall") {
+		if err := uninstallPlugin(); err != nil {
+			log.Fatalf("uninstall failed: %v", err)
+		}
+		fmt.Println("Plugin removed from ~/.gleann/plugins.json")
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		*versionFlag = true
 	}
 
 	if *versionFlag {
@@ -249,6 +290,52 @@ func installPlugin(port int) error {
 	return os.WriteFile(pluginsFile, out, 0644)
 }
 
+func uninstallPlugin() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	pluginsFile := filepath.Join(home, ".gleann", "plugins.json")
+	data, err := os.ReadFile(pluginsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	type pluginEntry struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	type registry struct {
+		Plugins []json.RawMessage `json:"plugins"`
+	}
+
+	var reg registry
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return err
+	}
+
+	var filtered []json.RawMessage
+	for _, raw := range reg.Plugins {
+		var p pluginEntry
+		if err := json.Unmarshal(raw, &p); err == nil {
+			if p.Name == httpserver.PluginName || p.Name == "gleann-docs" {
+				continue
+			}
+		}
+		filtered = append(filtered, raw)
+	}
+
+	reg.Plugins = filtered
+	out, err := json.MarshalIndent(reg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pluginsFile, out, 0644)
+}
+
 // runModels implements `gleann-plugin-docs models <download|verify|list>`: the
 // ONNX models of the hybrid page parser (~23 MB) or the Granite VLM model (~264 MB).
 func runModels(args []string) int {
@@ -392,15 +479,9 @@ func runTUI(port int) int {
 		fmt.Fprintln(os.Stderr, "gleann-plugin-docs tui needs an interactive terminal; use `gleann-plugin-docs config set <key> <value>` instead")
 		return 1
 	}
-	cfg, saved, err := tui.Run(tui.Hooks{Install: func() error { return installPlugin(port) }})
-	if err != nil {
+	if err := tui.RunApp(port); err != nil {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
 		return 1
-	}
-	if saved {
-		fmt.Printf("saved %s (engine=%s, profile=%s, vlm=%v)\n", config.Path(), cfg.Engine, cfg.Profile, cfg.VLM)
-	} else {
-		fmt.Println("not saved")
 	}
 	return 0
 }
