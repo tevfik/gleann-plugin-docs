@@ -86,7 +86,7 @@ jobs:
       - name: Build Binary
         run: |
           mkdir -p dist
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X github.com/tevfik/gleann-plugin-docs/internal/httpserver.PluginVersion=${GITHUB_REF_NAME#v}" \
             -o dist/gleann-plugin-docs-linux-amd64 ./cmd/gleann-plugin-docs
           cd dist
           tar -czf gleann-plugin-docs-linux-amd64.tar.gz gleann-plugin-docs-linux-amd64
@@ -128,7 +128,7 @@ jobs:
       - name: Build Binary for Linux ARM64
         run: |
           mkdir -p dist
-          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w -X github.com/tevfik/gleann-plugin-docs/internal/httpserver.PluginVersion=${GITHUB_REF_NAME#v}" \
             -o dist/gleann-plugin-docs-linux-arm64 ./cmd/gleann-plugin-docs
           cd dist
           tar -czf gleann-plugin-docs-linux-arm64.tar.gz gleann-plugin-docs-linux-arm64
@@ -161,7 +161,7 @@ jobs:
       - name: Build Binary for macOS ARM64
         run: |
           mkdir -p dist
-          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w -X github.com/tevfik/gleann-plugin-docs/internal/httpserver.PluginVersion=${GITHUB_REF_NAME#v}" \
             -o dist/gleann-plugin-docs-darwin-arm64 ./cmd/gleann-plugin-docs
           cd dist
           tar -czf gleann-plugin-docs-darwin-arm64.tar.gz gleann-plugin-docs-darwin-arm64

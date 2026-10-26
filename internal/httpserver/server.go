@@ -19,9 +19,12 @@ import (
 	"github.com/tevfik/gleann/modules/settings"
 )
 
+// PluginVersion is overridden at release build time with
+// -ldflags "-X github.com/tevfik/gleann-plugin-docs/internal/httpserver.PluginVersion=<tag without v>".
+var PluginVersion = "1.5.1"
+
 const (
-	PluginName    = "gleann-plugin-docs"
-	PluginVersion = "1.4.0"
+	PluginName = "gleann-plugin-docs"
 
 	// TimeoutSec is the per-request HTTP timeout gleann applies to this plugin
 	// (written to plugins.json). OCR of a scanned PDF takes about 1.7 s per page
