@@ -27,12 +27,12 @@ const (
 	// (written to plugins.json). OCR of a scanned PDF takes about 1.7 s per page
 	// on a 20-core ARM box, so gleann's default of 120 s cut off documents of
 	// roughly 70 pages.
-	TimeoutSec = 900
+	TimeoutSec    = 900
 	SchemaVersion = 2
 )
 
 var (
-	Capabilities = []string{"document-extraction"}
+	Capabilities  = []string{"document-extraction"}
 	SupportedExts = []string{
 		".pdf", ".docx", ".doc", ".xlsx", ".xls",
 		".pptx", ".ppt", ".epub", ".html", ".htm",
@@ -121,12 +121,12 @@ func (s *Server) Close() error {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":       "ok",
-		"plugin":       PluginName,
-		"version":      PluginVersion,
+		"status":         "ok",
+		"plugin":         PluginName,
+		"version":        PluginVersion,
 		"schema_version": SchemaVersion,
-		"capabilities": Capabilities,
-		"timeout":      TimeoutSec,
+		"capabilities":   Capabilities,
+		"timeout":        TimeoutSec,
 		"backends": map[string]bool{
 			"docling-eif": s.eng != nil && s.eng.IsAvailable(),
 			"bitllm.c":    s.eng != nil && s.eng.IsAvailable(),

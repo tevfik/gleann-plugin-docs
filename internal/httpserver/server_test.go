@@ -192,7 +192,6 @@ func TestConvertEndpoint_HTML(t *testing.T) {
 	}
 }
 
-
 func TestSettingsEndpoint(t *testing.T) {
 	t.Setenv(config.ConfigEnv, filepath.Join(t.TempDir(), "docs.json"))
 	ts := httptest.NewServer(New(nil, 0).Handler())
