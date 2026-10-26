@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 
 	ort "github.com/yalue/onnxruntime_go"
@@ -30,9 +32,41 @@ func ortLibGlobs() []string {
 	return []string{"libonnxruntime.so", "libonnxruntime.so.*"}
 }
 
+// MinORTMinor is the oldest ONNX Runtime 1.x the bindings load:
+// onnxruntime_go v1.26 asks for ORT API version 24, which 1.24 introduced.
+// Older libraries fail at start-up ("The requested API version [24] is not
+// available"), so they are skipped rather than picked.
+const MinORTMinor = 24
+
+var ortVersionRe = regexp.MustCompile(`onnxruntime[._-]?(?:so\.)?(\d+)\.(\d+)`)
+
+// ortLibVersion reads major.minor from the library file name (following
+// symlinks, so libonnxruntime.so -> libonnxruntime.so.1.21.0 counts too).
+func ortLibVersion(path string) (major, minor int, ok bool) {
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		path = r
+	}
+	m := ortVersionRe.FindStringSubmatch(filepath.Base(path))
+	if m == nil {
+		return 0, 0, false
+	}
+	major, _ = strconv.Atoi(m[1])
+	minor, _ = strconv.Atoi(m[2])
+	return major, minor, true
+}
+
+// ortTooOld reports whether path is a runtime the bindings cannot load. A
+// library without a version in its name is given the benefit of the doubt.
+func ortTooOld(path string) bool {
+	major, minor, ok := ortLibVersion(path)
+	return ok && major == 1 && minor < MinORTMinor
+}
+
 // FindORTLibrary locates libonnxruntime. Order: $GLEANN_ORT_LIB, next to the
 // executable, ~/.gleann/lib, then the usual system directories. When several
-// versions match in one directory the highest file name wins.
+// versions match in one directory the highest file name wins. Libraries older
+// than 1.MinORTMinor are skipped (a distribution's ORT 1.21 in /usr/lib must
+// not hide a usable one, nor stop InstallORT from installing it).
 func FindORTLibrary() (string, error) {
 	if p := os.Getenv(LibEnv); p != "" {
 		if _, err := os.Stat(p); err != nil {
@@ -50,14 +84,24 @@ func FindORTLibrary() (string, error) {
 	}
 	dirs = append(dirs, "/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/opt/homebrew/lib")
 
+	var tooOld string
 	for _, dir := range dirs {
 		for _, g := range ortLibGlobs() {
 			matches, _ := filepath.Glob(filepath.Join(dir, g))
-			if len(matches) > 0 {
-				sort.Strings(matches)
-				return matches[len(matches)-1], nil
+			sort.Strings(matches)
+			for i := len(matches) - 1; i >= 0; i-- {
+				if ortTooOld(matches[i]) {
+					if tooOld == "" {
+						tooOld = matches[i]
+					}
+					continue
+				}
+				return matches[i], nil
 			}
 		}
+	}
+	if tooOld != "" {
+		return "", fmt.Errorf("onnxruntime at %s is too old (need 1.%d or newer): run 'gleann-plugin-docs models download --ort' to install %s into ~/.gleann/lib, or set %s", tooOld, MinORTMinor, ORTVersion, LibEnv)
 	}
 	return "", fmt.Errorf("onnxruntime shared library not found (set %s or place libonnxruntime in ~/.gleann/lib)", LibEnv)
 }

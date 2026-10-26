@@ -66,3 +66,29 @@ func TestInstallORTVerifiesAndInstalls(t *testing.T) {
 		t.Fatalf("left files behind: %v", entries)
 	}
 }
+
+func TestORTTooOld(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, "libonnxruntime.so.1.21.0")
+	if err := os.WriteFile(old, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "libonnxruntime.so")
+	if err := os.Symlink(old, link); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]bool{
+		old:                                  true,
+		link:                                 true, // judged by its target
+		"/x/libonnxruntime.so.1.24.0":        false,
+		"/x/libonnxruntime.so." + ORTVersion: false,
+		"/x/libonnxruntime.1.20.1.dylib":     true,
+		"/x/libonnxruntime.so":               false, // no version: trust it
+		"/x/onnxruntime.dll":                 false,
+	}
+	for p, want := range cases {
+		if got := ortTooOld(p); got != want {
+			t.Errorf("ortTooOld(%s) = %v, want %v", p, got, want)
+		}
+	}
+}
