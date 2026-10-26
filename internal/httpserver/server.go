@@ -1,18 +1,22 @@
 package httpserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/tevfik/gleann-plugin-docs/internal/config"
 	"github.com/tevfik/gleann-plugin-docs/internal/engine"
 	"github.com/tevfik/gleann-plugin-docs/internal/parser"
+	"github.com/tevfik/gleann/modules/settings"
 )
 
 const (
@@ -56,20 +60,44 @@ func New(eng engine.Converter, port int) *Server {
 	}
 }
 
-// Serve starts the HTTP server.
-func (s *Server) Serve() error {
+// Handler routes the plugin's endpoints.
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/info", s.handleInfo)
 	mux.HandleFunc("/convert", s.handleConvert)
+	// Generic settings form for clients such as the gleann web UI. The server
+	// listens on loopback only and PUT is preflighted by browsers; the Host
+	// check keeps a DNS-rebound web page out too.
+	mux.Handle("/settings", config.Settings().Handler(loopbackHost))
+	// Model downloads for the same clients; they outlive the request.
+	mux.Handle("/models", config.Catalog().Handler(context.Background(), loopbackHost))
+	return mux
+}
 
+// loopbackHost reports whether the request was addressed to this machine by a
+// loopback name or address.
+func loopbackHost(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// Serve starts the HTTP server.
+func (s *Server) Serve() error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 	log.Printf("[%s] HTTP plugin listening on http://%s", PluginName, addr)
 
 	s.mu.Lock()
 	s.httpSrv = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: s.Handler(),
 	}
 	s.mu.Unlock()
 
@@ -115,6 +143,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"schema_version": SchemaVersion,
 		"capabilities":   Capabilities,
 		"extensions":     SupportedExts,
+		"settings":       map[string]any{"path": "/settings", "schema_version": settings.SchemaVersion},
 	})
 }
 

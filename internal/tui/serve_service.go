@@ -133,13 +133,13 @@ WantedBy=default.target
 		return fmt.Errorf("write service file: %w", err)
 	}
 	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
-	if err := exec.Command("systemctl", "--user", "enable", s.unit+".service").Run(); err != nil {
-		return fmt.Errorf("enable service: %w", err)
+	if out, err := exec.Command("systemctl", "--user", "enable", s.unit+".service").CombinedOutput(); err != nil {
+		return fmt.Errorf("enable service: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	// Stop first so that "start" launches the new binary rather than no-op.
 	_ = exec.Command("systemctl", "--user", "stop", s.unit+".service").Run()
-	if err := exec.Command("systemctl", "--user", "start", s.unit+".service").Run(); err != nil {
-		return fmt.Errorf("start service: %w", err)
+	if out, err := exec.Command("systemctl", "--user", "start", s.unit+".service").CombinedOutput(); err != nil {
+		return fmt.Errorf("start service: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

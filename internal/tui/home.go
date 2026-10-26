@@ -21,6 +21,7 @@ const (
 	ScreenUpdate
 	ScreenInstall
 	ScreenUninstall
+	ScreenSettings
 )
 
 type menuItem struct {
@@ -43,6 +44,7 @@ var postSetupMenuItems = []menuItem{
 	{title: "Serve", desc: "Plugin server for gleann (HTTP daemon on :8765)", icon: "🔌", screen: ScreenServe}, // replaced by serveMenuItem at runtime
 	{title: "Models", desc: "Verify & download OCR and VLM model weights", icon: "🔬", screen: ScreenModels},
 	{title: "Setup", desc: "Configure page parser, OCR profile, VLM & DPI", icon: "⚙ ", screen: ScreenSetup},
+	{title: "Settings", desc: "Every setting, one at a time (the same ones as the gleann web UI)", icon: "🎛 ", screen: ScreenSettings},
 	{title: "Update", desc: "Update from the latest GitHub release", icon: "⬆ ", screen: ScreenUpdate},
 	{title: "Install", desc: "Register plugin into ~/.gleann/plugins.json", icon: "📦", screen: ScreenInstall},
 	{title: "Uninstall", desc: "Remove plugin from ~/.gleann/plugins.json", icon: "🗑 ", screen: ScreenUninstall},

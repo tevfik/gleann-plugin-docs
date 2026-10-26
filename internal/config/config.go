@@ -36,6 +36,24 @@ type Config struct {
 	VLM     bool   `json:"vlm,omitempty"`         // use the Granite-Docling VLM for scanned pages
 	Deep    bool   `json:"deep_tables,omitempty"` // send tables to the VLM (needs VLM)
 
+	// VLM tuning: how many scanned pages of a document the VLM reads before
+	// the ONNX parser takes over (0 = none while the parser is installed),
+	// whether every page goes to the VLM, and the CPU threads it uses
+	// (0 = half the cores, at least 4).
+	VLMMaxPages int  `json:"vlm_max_pages,omitempty"`
+	ForceVLM    bool `json:"force_vlm,omitempty"`
+	Threads     int  `json:"threads,omitempty"`
+
+	// Offline never downloads missing models.
+	Offline bool `json:"offline,omitempty"`
+
+	// Paths that override the lookups (empty = the default).
+	ORTLib       string `json:"ort_lib,omitempty"`       // libonnxruntime
+	SOffice      string `json:"soffice,omitempty"`       // LibreOffice soffice, for .doc/.ppt/.xls
+	ParserModels string `json:"parser_models,omitempty"` // layout + PP-OCR models
+	VLMModels    string `json:"vlm_models,omitempty"`    // Granite-Docling VLM
+	IndraModels  string `json:"indra_models,omitempty"`  // Indra OCR models
+
 	// IndraLicenseAccepted records that the user confirmed the Indra weights' license.
 	IndraLicenseAccepted bool `json:"indra_license_accepted,omitempty"`
 
@@ -73,6 +91,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DPI != 0 && (c.DPI < 72 || c.DPI > 600) {
 		return fmt.Errorf("dpi %d: want 72..600", c.DPI)
+	}
+	if c.VLMMaxPages < 0 || c.Threads < 0 {
+		return fmt.Errorf("vlm_max_pages and threads must not be negative")
 	}
 	return nil
 }
@@ -117,6 +138,26 @@ func (c *Config) Env() map[string]string {
 	if c.Completed {
 		env["GLEANN_DOCLING_VLM"] = boolEnv(c.VLM)
 		env["GLEANN_DOCLING_ONNX_DEEP"] = boolEnv(c.VLM && c.Deep)
+	}
+	if c.VLM && c.VLMMaxPages > 0 {
+		env["GLEANN_DOCLING_VLM_MAX_PAGES"] = fmt.Sprint(c.VLMMaxPages)
+	}
+	if c.VLM && c.ForceVLM {
+		env["GLEANN_DOCLING_FORCE_VLM"] = "1"
+	}
+	if c.Threads > 0 {
+		env["GLEANN_DOCLING_THREADS"] = fmt.Sprint(c.Threads)
+	}
+	if c.Offline {
+		env["GLEANN_DOCPARSER_OFFLINE"] = "1"
+	}
+	for name, path := range map[string]string{
+		"GLEANN_ORT_LIB": c.ORTLib, "GLEANN_SOFFICE": c.SOffice, "GLEANN_DOCPARSER_MODELS": c.ParserModels,
+		"GLEANN_DOCLING_MODELS": c.VLMModels, "GLEANN_INDRA_MODELS": c.IndraModels,
+	} {
+		if path != "" {
+			env[name] = path
+		}
 	}
 	return env
 }

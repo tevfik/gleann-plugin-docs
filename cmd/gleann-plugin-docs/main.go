@@ -169,10 +169,11 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Like the server: a VLM that cannot load (model not downloaded yet)
+		// leaves the text layer, the Office extractors and the ONNX parser.
 		eng, err := engine.NewEIFDoclingEngine(*cModelFlag, *cTokenizerFlag)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to initialize engine: %v\n", err)
-			os.Exit(1)
+			log.Printf("[warning] VLM model failed to load (%v); converting without it. Download it from Setup -> Download Models.", err)
 		}
 		defer eng.Close()
 
@@ -504,26 +505,20 @@ func runConfig(args []string) int {
 		return 2
 	}
 	key, val := args[1], args[2]
-	b := func() bool { v := strings.ToLower(val); return v == "1" || v == "true" || v == "on" || v == "yes" }
-	switch key {
-	case "engine":
-		cfg.Engine = val
-	case "ocr_profile":
-		cfg.Profile = val
-	case "dpi":
-		if _, err := fmt.Sscanf(val, "%d", &cfg.DPI); err != nil {
-			fmt.Fprintf(os.Stderr, "dpi: %v\n", err)
+	if key == "indra_license_accepted" { // not a web setting: accepted here or in the TUI
+		v := strings.ToLower(val)
+		cfg.IndraLicenseAccepted = v == "1" || v == "true" || v == "on" || v == "yes"
+	} else {
+		_, errs := config.Settings().Update(cfg, map[string]any{key: val})
+		for k, msg := range errs {
+			if k == "" {
+				k = "config"
+			}
+			fmt.Fprintf(os.Stderr, "%s: %s\n", k, msg)
+		}
+		if len(errs) > 0 {
 			return 2
 		}
-	case "vlm":
-		cfg.VLM = b()
-	case "deep_tables":
-		cfg.Deep = b()
-	case "indra_license_accepted":
-		cfg.IndraLicenseAccepted = b()
-	default:
-		fmt.Fprintf(os.Stderr, "unknown key %q\n", key)
-		return 2
 	}
 	cfg.Completed = true
 	if err := config.Save(cfg); err != nil {

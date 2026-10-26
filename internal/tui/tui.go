@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,8 +46,6 @@ const (
 	itemSave
 	itemCount
 )
-
-var dpiChoices = []int{150, 200, 300}
 
 type mode int
 
@@ -88,12 +87,7 @@ func New(cfg *config.Config, h Hooks) Model {
 	if h.Save == nil {
 		h.Save = config.Save
 	}
-	if cfg.Engine == "" {
-		cfg.Engine = config.EngineAuto
-	}
-	if cfg.Profile == "" {
-		cfg.Profile = "latin"
-	}
+	fillDefaults(cfg)
 	return Model{cfg: cfg, hooks: h}
 }
 
@@ -191,47 +185,40 @@ func (m Model) updatePlugin() (tea.Model, tea.Cmd) {
 	}
 }
 
-// change steps the value under the cursor.
-func (m *Model) change(d int) {
-	switch m.cursor {
-	case itemEngine:
-		m.cfg.Engine = step(config.Engines, m.cfg.Engine, d)
-	case itemProfile:
-		m.cfg.Profile = step(config.Profiles, m.cfg.Profile, d)
-	case itemVLM:
-		m.cfg.VLM = !m.cfg.VLM
-		if !m.cfg.VLM {
-			m.cfg.Deep = false
-		}
-	case itemDeep:
-		if m.cfg.VLM {
-			m.cfg.Deep = !m.cfg.Deep
-		} else {
-			m.status = "deep tables need the Granite VLM"
-		}
-	case itemDPI:
-		cur := m.cfg.DPI
-		if cur == 0 {
-			cur = dpiChoices[0]
-		}
-		idx := 0
-		for i, v := range dpiChoices {
-			if v == cur {
-				idx = i
-			}
-		}
-		m.cfg.DPI = dpiChoices[(idx+d+len(dpiChoices))%len(dpiChoices)]
-	}
+// settingKeys maps menu rows to config.Settings fields, which supply the
+// values a row steps through and the rules (the same ones the web form and
+// `config set` use).
+var settingKeys = map[item]string{
+	itemEngine: "engine", itemProfile: "ocr_profile", itemVLM: "vlm", itemDeep: "deep_tables", itemDPI: "dpi",
 }
 
-func step(list []string, cur string, d int) string {
-	idx := 0
-	for i, v := range list {
-		if v == cur {
-			idx = i
-		}
+// change steps the value under the cursor.
+func (m *Model) change(d int) {
+	key, ok := settingKeys[m.cursor]
+	if !ok {
+		return
 	}
-	return list[(idx+d+len(list))%len(list)]
+	reg, next := config.Settings(), *m.cfg
+	err := reg.Step(&next, key, d)
+	if err == nil {
+		err = reg.Validate(&next)
+	}
+	if err != nil {
+		m.status = err.Error()
+		return
+	}
+	fillDefaults(&next)
+	*m.cfg = next
+}
+
+// fillDefaults spells out the defaults the menu shows.
+func fillDefaults(cfg *config.Config) {
+	if cfg.Engine == "" {
+		cfg.Engine = config.EngineAuto
+	}
+	if cfg.Profile == "" {
+		cfg.Profile = "latin"
+	}
 }
 
 func (m Model) save() (tea.Model, tea.Cmd) {
@@ -559,21 +546,21 @@ func RunApp(port int) error {
 			runSubcommand("install")
 		case ScreenUninstall:
 			runSubcommand("uninstall")
+		case ScreenSettings:
+			if _, err := tea.NewProgram(NewSettingsModel(), tea.WithAltScreen()).Run(); err != nil {
+				return fmt.Errorf("settings: %w", err)
+			}
 		}
 	}
 }
 
 func runSetupWizard(port int) error {
 	cfg := config.Load()
+	// The Setup screen stays on while these run, so their output must not go
+	// to the terminal; the screen reports the outcome on its status line.
 	h := Hooks{
-		Install: func() error {
-			runSubcommand("install")
-			return nil
-		},
-		Update: func() error {
-			runSubcommand("update")
-			return nil
-		},
+		Install: func() error { return runQuiet("install") },
+		Update:  func() error { return runQuiet("update") },
 	}
 	m := New(cfg, h)
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -588,6 +575,24 @@ func runSetupWizard(port int) error {
 	return nil
 }
 
+// runQuiet runs another gleann-plugin-docs command without the terminal and
+// returns its last output lines as the error when it fails.
+func runQuiet(args ...string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	out, err := exec.Command(exe, args...).CombinedOutput()
+	if err != nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) > 2 {
+			lines = lines[len(lines)-2:]
+		}
+		return fmt.Errorf("%v: %s", err, strings.Join(lines, " / "))
+	}
+	return nil
+}
+
 func runSubcommand(args ...string) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -596,7 +601,7 @@ func runSubcommand(args ...string) {
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := runForeground(cmd); err != nil {
 		fmt.Fprintf(os.Stderr, "\n%v\n", err)
 	}
 	fmt.Println("\nPress enter to return to menu...")
@@ -625,8 +630,18 @@ func runCLIMode(mode string, extraArgs ...string) {
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	_ = cmd.Run()
+	_ = runForeground(cmd)
 	fmt.Println("\nPress enter to return to menu...")
 	buf := make([]byte, 1)
 	_, _ = os.Stdin.Read(buf)
+}
+
+// runForeground runs cmd in this terminal. Ctrl+C reaches the whole
+// foreground process group, so while cmd runs this process ignores it: the
+// key stops the command and the menu comes back instead of closing.
+func runForeground(cmd *exec.Cmd) error {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	defer signal.Stop(sig)
+	return cmd.Run()
 }

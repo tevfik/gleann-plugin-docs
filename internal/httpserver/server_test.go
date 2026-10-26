@@ -7,8 +7,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tevfik/gleann-plugin-docs/internal/config"
 )
 
 type mockEngine struct {
@@ -189,3 +192,42 @@ func TestConvertEndpoint_HTML(t *testing.T) {
 	}
 }
 
+
+func TestSettingsEndpoint(t *testing.T) {
+	t.Setenv(config.ConfigEnv, filepath.Join(t.TempDir(), "docs.json"))
+	ts := httptest.NewServer(New(nil, 0).Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/settings")
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("GET /settings: %v %v", resp, err)
+	}
+	var form struct {
+		Revision string
+		Fields   []struct{ Key string }
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&form)
+	resp.Body.Close()
+	if len(form.Fields) != len(config.Settings().Fields) || form.Revision == "" {
+		t.Fatalf("form: %+v", form)
+	}
+
+	body := strings.NewReader(`{"values":{"engine":"paddle","dpi":200,"vlm":true,"deep_tables":true},"revision":"` + form.Revision + `"}`)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/settings", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("PUT /settings: %v %v", resp, err)
+	}
+	resp.Body.Close()
+	if c := config.Load(); c.Engine != "paddle" || c.DPI != 200 || !c.Deep || !c.Completed {
+		t.Errorf("saved config: %+v", c)
+	}
+
+	// A request addressed to another host name (DNS rebinding) is refused.
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/settings", nil)
+	req.Host = "evil.example:8765"
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("foreign Host: %v %v", resp, err)
+	}
+}
