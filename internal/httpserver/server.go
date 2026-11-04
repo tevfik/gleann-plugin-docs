@@ -21,7 +21,7 @@ import (
 
 // PluginVersion is overridden at release build time with
 // -ldflags "-X github.com/tevfik/gleann-plugin-docs/internal/httpserver.PluginVersion=<tag without v>".
-var PluginVersion = "1.5.1"
+var PluginVersion = "1.5.3"
 
 const (
 	PluginName = "gleann-plugin-docs"

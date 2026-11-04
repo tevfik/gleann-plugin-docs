@@ -392,28 +392,6 @@ func (m Model) itemsMeta() [itemCount]itemMeta {
 	}
 }
 
-func (m Model) rows() [itemCount][2]string {
-	dpi := m.cfg.DPI
-	if dpi == 0 {
-		dpi = 150
-	}
-	deep := onOff(m.cfg.Deep)
-	if !m.cfg.VLM {
-		deep = "off (needs VLM)"
-	}
-	return [itemCount][2]string{
-		itemEngine:  {"Page parser", m.cfg.Engine + "   " + engineHint(m.cfg.Engine)},
-		itemProfile: {"PP-OCR profile", m.cfg.Profile},
-		itemVLM:     {"Granite VLM", onOff(m.cfg.VLM)},
-		itemDeep:    {"Deep tables", deep},
-		itemDPI:     {"PDF page DPI", fmt.Sprint(dpi)},
-		itemModels:  {"Download models", "enter"},
-		itemInstall: {"Register in gleann", "enter"},
-		itemUpdate:  {"Update plugin", "enter"},
-		itemSave:    {"Save and quit", "enter  (or s)"},
-	}
-}
-
 func engineHint(e string) string {
 	switch e {
 	case config.EngineAuto:

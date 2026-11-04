@@ -296,10 +296,7 @@ func getAttr(n *nethtml.Node, key string) string {
 }
 
 func normalizeWhitespace(s string) string {
-	var words []string
-	for _, f := range strings.Fields(s) {
-		words = append(words, f)
-	}
+	words := strings.Fields(s)
 	if len(words) == 0 {
 		if len(s) > 0 && (s[0] == ' ' || s[0] == '\n' || s[0] == '\t') {
 			return " "

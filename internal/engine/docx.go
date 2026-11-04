@@ -48,10 +48,6 @@ func ExtractDocx(filePath string) (string, error) {
 	return parseDocumentXMLWithStyles(rc, styles)
 }
 
-func parseDocumentXML(r io.Reader) (string, error) {
-	return parseDocumentXMLWithStyles(r, nil)
-}
-
 var (
 	headingNameRe = regexp.MustCompile(`^(?:heading|başlık|baslik)\s*(\d)$`)
 	// Localized style ids look like "Heading1" / "Balk1" (Turkish "Başlık 1").

@@ -10,11 +10,6 @@ func word(x0, y0, x1, y1 float64, t string) bboxWord {
 	return bboxWord{XMin: x0, YMin: y0, XMax: x1, YMax: y1, Text: t}
 }
 
-// cellLine is one table row of two cells, each a single word, 10pt high.
-func cellLine(y float64, a, b string) bboxLine {
-	return bboxLine{Words: []bboxWord{word(100, y, 140, y+10, a)}}
-}
-
 func TestSpliceTables(t *testing.T) {
 	pg := bboxPage{Width: 600, Height: 800, Blocks: []bboxBlock{
 		{Lines: []bboxLine{

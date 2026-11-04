@@ -23,7 +23,7 @@ type rootFile struct {
 
 // opfPackage defines the structure of the OPF package document.
 type opfPackage struct {
-	XMLName  xml.Name      `xml:"package"`
+	XMLName  xml.Name       `xml:"package"`
 	Manifest []manifestItem `xml:"manifest>item"`
 	Spine    []spineItemref `xml:"spine>itemref"`
 }

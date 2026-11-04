@@ -168,6 +168,6 @@ func (e *e2eEngine) Convert(ctx context.Context, filePath string) (string, int, 
 	return string(b), 1, err
 }
 
-func (e *e2eEngine) IsAvailable() bool { return true }
+func (e *e2eEngine) IsAvailable() bool   { return true }
 func (e *e2eEngine) BackendName() string { return "docling-eif" }
-func (e *e2eEngine) Close() error { return nil }
+func (e *e2eEngine) Close() error        { return nil }
