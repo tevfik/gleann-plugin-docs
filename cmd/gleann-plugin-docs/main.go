@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/tevfik/gleann-plugin-docs/internal/config"
 	"github.com/tevfik/gleann-plugin-docs/internal/docparser"
@@ -221,17 +222,29 @@ func main() {
 		srv := httpserver.New(eng, *portFlag)
 		defer srv.Close()
 
+		// SIGINT/SIGTERM: stop accepting requests, let running conversions finish
+		// (they remove their temporary files), then exit 0.
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		shutdownDone := make(chan struct{})
 		go func() {
+			defer close(shutdownDone)
 			<-sigCh
 			log.Println("[gleann-plugin-docs] Shutting down...")
-			_ = srv.Close()
-			os.Exit(0)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil {
+				log.Printf("[gleann-plugin-docs] shutdown: %v", err)
+			}
 		}()
 
 		if err := srv.Serve(); err != nil {
 			log.Fatalf("server terminated: %v", err)
+		}
+		// Serve returns as soon as Shutdown starts; wait for it to finish.
+		select {
+		case <-shutdownDone:
+		case <-time.After(25 * time.Second):
 		}
 		return
 	}

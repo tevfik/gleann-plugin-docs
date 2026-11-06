@@ -51,6 +51,10 @@ type Server struct {
 	port    int
 	mu      sync.RWMutex
 	httpSrv *http.Server
+	stopped bool // Shutdown/Close ran: Serve must not start (or report an error)
+
+	closeEng sync.Once
+	engErr   error
 }
 
 // New creates a new HTTP plugin server.
@@ -102,27 +106,68 @@ func (s *Server) Serve() error {
 	log.Printf("[%s] HTTP plugin listening on http://%s", PluginName, addr)
 
 	s.mu.Lock()
-	s.httpSrv = &http.Server{
+	if s.stopped {
+		s.mu.Unlock()
+		return nil
+	}
+	srv := &http.Server{
 		Addr:    addr,
 		Handler: s.Handler(),
 	}
+	s.httpSrv = srv
 	s.mu.Unlock()
 
-	return s.httpSrv.ListenAndServe()
+	// A requested shutdown is not an error: ErrServerClosed means Shutdown or
+	// Close ran, so the process can exit 0.
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// Shutdown stops accepting requests, waits for running conversions to finish
+// (so their temporary files are removed by the handlers) until ctx ends, then
+// frees the engine. Serve returns nil once it has been called.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.stopped = true
+	srv := s.httpSrv
+	s.mu.Unlock()
+
+	var err error
+	if srv != nil {
+		if err = srv.Shutdown(ctx); err != nil {
+			_ = srv.Close() // deadline: drop the remaining connections
+		}
+	}
+	if cerr := s.closeEngine(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // Close shuts down the HTTP server and frees engine resources.
 func (s *Server) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stopped = true
+	srv := s.httpSrv
+	s.mu.Unlock()
 
-	if s.httpSrv != nil {
-		_ = s.httpSrv.Close()
+	if srv != nil {
+		_ = srv.Close()
 	}
-	if s.eng != nil {
-		return s.eng.Close()
-	}
-	return nil
+	return s.closeEngine()
+}
+
+// closeEngine closes the engine exactly once (Shutdown and a deferred Close
+// may both run).
+func (s *Server) closeEngine() error {
+	s.closeEng.Do(func() {
+		if s.eng != nil {
+			s.engErr = s.eng.Close()
+		}
+	})
+	return s.engErr
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
