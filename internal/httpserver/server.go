@@ -3,6 +3,7 @@ package httpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -53,6 +54,9 @@ type Server struct {
 }
 
 // New creates a new HTTP plugin server.
+// maxUploadBytes bounds the request body of /convert.
+const maxUploadBytes = 256 << 20
+
 func New(eng engine.Converter, port int) *Server {
 	if port <= 0 {
 		port = 8765
@@ -156,8 +160,16 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 256 MB max upload
-	if err := r.ParseMultipartForm(256 << 20); err != nil {
+	// The 256 MB argument of ParseMultipartForm is only the in-memory
+	// threshold; the body itself is capped so an oversized upload is refused
+	// instead of being spooled to disk and decoded (P-05).
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds %d MB", maxUploadBytes>>20))
+			return
+		}
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse multipart: %v", err))
 		return
 	}

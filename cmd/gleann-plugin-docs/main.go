@@ -48,6 +48,19 @@ func main() {
 
 	flag.Parse()
 
+	// The Go flag package stops at the first non-flag word, so `serve --port N`
+	// (the form the autostart units use) would otherwise ignore the flags that
+	// follow the subcommand (P-07).
+	if len(os.Args) > 2 && (os.Args[1] == "serve" || os.Args[1] == "plugin-serve") {
+		rest := os.Args[2:]
+		if len(rest) > 0 && (rest[0] == "enable" || rest[0] == "disable" || rest[0] == "status") {
+			rest = rest[1:]
+		}
+		if err := flag.CommandLine.Parse(rest); err != nil {
+			os.Exit(2)
+		}
+	}
+
 	// ~/.gleann/docs.json (written by `tui`) fills the GLEANN_DOCLING_* variables
 	// that are not set; the setup commands themselves must not depend on it.
 	if len(os.Args) < 2 || (os.Args[1] != "tui" && os.Args[1] != "config") {
