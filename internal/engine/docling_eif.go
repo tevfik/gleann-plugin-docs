@@ -269,19 +269,34 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 			return "", 0, err
 		}
 		return string(b), 1, nil
+	case ".odt", ".ods", ".odp", ".rtf":
+		md, err := convertAnyDoc(ctx, filePath)
+		if err != nil {
+			return "", 0, fmt.Errorf("conversion failed: %w", err)
+		}
+		return md, 1, nil
 	case ".docx":
+		if md, err := convertAnyDoc(ctx, filePath); err == nil && md != "" {
+			return e.appendEmbeddedImageText(ctx, md, filePath, "word/media"), 1, nil
+		}
 		md, err := ExtractDocx(filePath)
 		if err != nil {
 			return "", 0, err
 		}
 		return e.appendEmbeddedImageText(ctx, md, filePath, "word/media"), 1, nil
 	case ".pptx":
+		if md, err := convertAnyDoc(ctx, filePath); err == nil && md != "" {
+			return e.appendEmbeddedImageText(ctx, md, filePath, "ppt/media"), 1, nil
+		}
 		md, pages, err := ExtractPPTX(filePath)
 		if err != nil {
 			return "", 0, err
 		}
 		return e.appendEmbeddedImageText(ctx, md, filePath, "ppt/media"), pages, nil
 	case ".xlsx":
+		if md, err := convertAnyDoc(ctx, filePath); err == nil && md != "" {
+			return md, 1, nil
+		}
 		md, sheets, err := ExtractXLSX(filePath)
 		if err != nil {
 			return "", 0, err

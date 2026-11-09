@@ -19,9 +19,19 @@ build-bitllm:
 		mkdir -p ext/bitllm.c/build && cd ext/bitllm.c/build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$$(nproc) bitllm_static; \
 	fi
 
+build-anydoc:
+	@if [ ! -f ext/anydoc/target/release/libanydoc_ffi.a ]; then \
+		echo "🔧 Building anydoc static library..."; \
+		cd ext/anydoc && cargo build --release; \
+	fi
+
 build: build-bitllm
 	@mkdir -p $(BIN_DIR)
 	go build -o $(BIN_DIR)/$(BINARY_NAME) ./$(SRC_DIR)
+
+build-all: build-bitllm build-anydoc
+	@mkdir -p $(BIN_DIR)
+	go build -tags anydoc -o $(BIN_DIR)/$(BINARY_NAME) ./$(SRC_DIR)
 
 test:
 	go test -v ./internal/parser ./internal/httpserver ./internal/docparser

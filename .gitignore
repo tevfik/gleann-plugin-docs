@@ -12,6 +12,8 @@ __pycache__/
 bin/
 /gleann-plugin-docs
 *.log
+target/
+ext/anydoc/target/
 
 # OS generated files
 .DS_Store
