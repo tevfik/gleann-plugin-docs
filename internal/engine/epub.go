@@ -3,6 +3,7 @@ package engine
 import (
 	"archive/zip"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -41,6 +42,10 @@ type spineItemref struct {
 // ExtractEPUB extracts reading chapters from an EPUB file into Markdown.
 // Returns the concatenated markdown, chapter count, and any error.
 func ExtractEPUB(filePath string) (string, int, error) {
+	return extractEPUB(newOutBudget(), filePath)
+}
+
+func extractEPUB(ob *outBudget, filePath string) (string, int, error) {
 	z, err := zip.OpenReader(filePath)
 	if err != nil {
 		return "", 0, fmt.Errorf("open epub zip %s: %w", filePath, err)
@@ -48,11 +53,12 @@ func ExtractEPUB(filePath string) (string, int, error) {
 	defer z.Close()
 
 	// 1. Locate the OPF package file
-	opfPath := findOPFPath(z)
+	budget := newZipBudget()
+	opfPath := findOPFPath(budget, z)
 
 	var chapterFiles []string
 	if opfPath != "" {
-		chapterFiles = getSpineFiles(z, opfPath)
+		chapterFiles = getSpineFiles(budget, z, opfPath)
 	}
 
 	// 2. Fallback if OPF spine wasn't resolved: sort all HTML/XHTML entries
@@ -73,6 +79,7 @@ func ExtractEPUB(filePath string) (string, int, error) {
 
 	var chapters []string
 	validCount := 0
+	read := map[*zip.File]bool{}
 
 	for _, chPath := range chapterFiles {
 		norm := path.Clean(strings.ReplaceAll(chPath, "\\", "/"))
@@ -87,16 +94,23 @@ func ExtractEPUB(filePath string) (string, int, error) {
 				}
 			}
 		}
-		if !ok {
+		if !ok || read[zf] {
 			continue
 		}
+		read[zf] = true
 
-		rc, err := zf.Open()
+		rc, err := openEntry(budget, zf)
+		if errors.Is(err, ErrTooLarge) {
+			return "", 0, err
+		}
 		if err != nil {
 			continue
 		}
-		md, err := ExtractHTML(rc)
+		md, err := extractHTML(ob, rc)
 		_ = rc.Close()
+		if errors.Is(err, ErrTooLarge) {
+			return "", 0, err
+		}
 
 		if err == nil && strings.TrimSpace(md) != "" {
 			chapters = append(chapters, md)
@@ -108,14 +122,18 @@ func ExtractEPUB(filePath string) (string, int, error) {
 		return "", 0, fmt.Errorf("failed to extract content from epub %s", filePath)
 	}
 
-	return strings.Join(chapters, "\n\n---\n\n"), validCount, nil
+	joined, err := joinBudgeted(ob, chapters, "\n\n---\n\n")
+	if err != nil {
+		return "", 0, err
+	}
+	return joined, validCount, nil
 }
 
-func findOPFPath(z *zip.ReadCloser) string {
+func findOPFPath(budget *zipBudget, z *zip.ReadCloser) string {
 	// Look in META-INF/container.xml
 	for _, f := range z.File {
 		if strings.EqualFold(f.Name, "META-INF/container.xml") {
-			rc, err := f.Open()
+			rc, err := openEntry(budget, f)
 			if err == nil {
 				data, _ := io.ReadAll(rc)
 				_ = rc.Close()
@@ -142,7 +160,7 @@ func findOPFPath(z *zip.ReadCloser) string {
 	return ""
 }
 
-func getSpineFiles(z *zip.ReadCloser, opfPath string) []string {
+func getSpineFiles(budget *zipBudget, z *zip.ReadCloser, opfPath string) []string {
 	var opfFile *zip.File
 	for _, f := range z.File {
 		if strings.EqualFold(f.Name, opfPath) {
@@ -154,7 +172,7 @@ func getSpineFiles(z *zip.ReadCloser, opfPath string) []string {
 		return nil
 	}
 
-	rc, err := opfFile.Open()
+	rc, err := openEntry(budget, opfFile)
 	if err != nil {
 		return nil
 	}
@@ -174,10 +192,17 @@ func getSpineFiles(z *zip.ReadCloser, opfPath string) []string {
 	}
 
 	var ordered []string
+	seen := map[string]bool{}
 	for _, sp := range pkg.Spine {
 		href, ok := itemMap[sp.IDRef]
 		if ok && href != "" {
 			full := path.Join(baseDir, href)
+			// A chapter listed twice is read once: repeating itemrefs must
+			// not multiply the output.
+			if seen[full] {
+				continue
+			}
+			seen[full] = true
 			ordered = append(ordered, full)
 		}
 	}

@@ -10,6 +10,7 @@ import (
 // P-06: a requested shutdown is not an error. Serve must return nil (the
 // process then exits 0), also when Shutdown runs before Serve has started.
 func TestServeReturnsNilAfterShutdown(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

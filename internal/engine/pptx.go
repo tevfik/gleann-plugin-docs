@@ -3,6 +3,7 @@ package engine
 import (
 	"archive/zip"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -17,6 +18,10 @@ import (
 // paragraphs become list items, tables become Markdown tables and speaker
 // notes are appended as a quote.
 func ExtractPPTX(filePath string) (string, int, error) {
+	return extractPPTX(newOutBudget(), filePath)
+}
+
+func extractPPTX(ob *outBudget, filePath string) (string, int, error) {
 	r, err := zip.OpenReader(filePath)
 	if err != nil {
 		return "", 0, fmt.Errorf("open pptx zip: %w", err)
@@ -28,23 +33,31 @@ func ExtractPPTX(filePath string) (string, int, error) {
 		files[filepath.ToSlash(f.Name)] = f
 	}
 
-	slidePaths := orderedSlides(files)
+	budget := newZipBudget()
+	slidePaths := orderedSlides(budget, files)
 	if len(slidePaths) == 0 {
 		return "", 0, fmt.Errorf("no slides found in pptx")
 	}
 
-	var sb strings.Builder
+	sb := newMDBuilderOn(ob)
 	for idx, sp := range slidePaths {
 		slideNum := idx + 1
 		f := files[sp]
-		title, body, err := extractSlideContent(f)
+		title, body, err := extractSlideContent(budget, ob, f)
+		if errors.Is(err, ErrTooLarge) || errors.Is(err, ErrCorruptInput) {
+			return "", 0, err
+		}
 		if err != nil {
 			continue
 		}
 
 		notes := ""
-		if nf := files[notesPathFor(files, sp)]; nf != nil {
-			if _, nb, err := extractSlideContent(nf); err == nil {
+		if nf := files[notesPathFor(budget, files, sp)]; nf != nil {
+			_, nb, err := extractSlideContent(budget, ob, nf)
+			if errors.Is(err, ErrTooLarge) || errors.Is(err, ErrCorruptInput) {
+				return "", 0, err
+			}
+			if err == nil {
 				notes = strings.TrimSpace(nb)
 			}
 		}
@@ -55,15 +68,18 @@ func ExtractPPTX(filePath string) (string, int, error) {
 		}
 
 		if title != "" {
-			fmt.Fprintf(&sb, "## Slide %d: %s\n\n", slideNum, title)
+			fmt.Fprintf(sb, "## Slide %d: %s\n\n", slideNum, title)
 		} else {
-			fmt.Fprintf(&sb, "## Slide %d\n\n", slideNum)
+			fmt.Fprintf(sb, "## Slide %d\n\n", slideNum)
 		}
 		if body != "" {
 			sb.WriteString(body + "\n\n")
 		}
 		if notes != "" {
 			sb.WriteString("> Notes: " + strings.ReplaceAll(notes, "\n\n", "\n> ") + "\n\n")
+		}
+		if err := sb.Err(); err != nil {
+			return "", 0, err
 		}
 	}
 
@@ -79,12 +95,12 @@ func parseSlideNumber(name string) int {
 }
 
 // readRels parses an OPC .rels part into id -> target.
-func readRels(f *zip.File) map[string]string {
+func readRels(budget *zipBudget, f *zip.File) map[string]string {
 	out := map[string]string{}
 	if f == nil {
 		return out
 	}
-	rc, err := f.Open()
+	rc, err := openEntry(budget, f)
 	if err != nil {
 		return out
 	}
@@ -120,11 +136,12 @@ func resolvePart(base, target string) string {
 
 // orderedSlides returns slide parts in presentation order, falling back to
 // numeric file-name order when presentation.xml cannot be used.
-func orderedSlides(files map[string]*zip.File) []string {
+func orderedSlides(budget *zipBudget, files map[string]*zip.File) []string {
 	var out []string
+	seen := map[string]bool{}
 	if pf := files["ppt/presentation.xml"]; pf != nil {
-		rels := readRels(files["ppt/_rels/presentation.xml.rels"])
-		if rc, err := pf.Open(); err == nil {
+		rels := readRels(budget, files["ppt/_rels/presentation.xml.rels"])
+		if rc, err := openEntry(budget, pf); err == nil {
 			dec := xml.NewDecoder(rc)
 			for {
 				tok, err := dec.Token()
@@ -136,7 +153,10 @@ func orderedSlides(files map[string]*zip.File) []string {
 						if a.Name.Local == "id" && strings.HasPrefix(a.Value, "rId") {
 							if t := rels[a.Value]; t != "" {
 								p := resolvePart("ppt/presentation.xml", t)
-								if files[p] != nil {
+								// A slide referenced twice is still one slide: repeating
+								// it would multiply the output for a few bytes of XML.
+								if files[p] != nil && !seen[p] {
+									seen[p] = true
 									out = append(out, p)
 								}
 							}
@@ -160,9 +180,9 @@ func orderedSlides(files map[string]*zip.File) []string {
 	return out
 }
 
-func notesPathFor(files map[string]*zip.File, slidePath string) string {
+func notesPathFor(budget *zipBudget, files map[string]*zip.File, slidePath string) string {
 	relPath := path.Join(path.Dir(slidePath), "_rels", path.Base(slidePath)+".rels")
-	for _, target := range readRels(files[relPath]) {
+	for _, target := range readRels(budget, files[relPath]) {
 		if strings.Contains(target, "notesSlide") {
 			return resolvePart(slidePath, target)
 		}
@@ -183,8 +203,8 @@ type pptxTable struct {
 }
 
 // extractSlideContent returns the slide title and the Markdown body.
-func extractSlideContent(f *zip.File) (string, string, error) {
-	rc, err := f.Open()
+func extractSlideContent(budget *zipBudget, ob *outBudget, f *zip.File) (string, string, error) {
+	rc, err := openEntry(budget, f)
 	if err != nil {
 		return "", "", err
 	}
@@ -192,7 +212,8 @@ func extractSlideContent(f *zip.File) (string, string, error) {
 
 	decoder := xml.NewDecoder(rc)
 
-	var body strings.Builder
+	body := newMDBuilderOn(ob)
+	defer body.Discard() // the caller gets a copy and charges it where it keeps it
 	var title string
 	var para *pptxPara
 	var tbl *pptxTable
@@ -277,7 +298,8 @@ func extractSlideContent(f *zip.File) (string, string, error) {
 				if para != nil {
 					for _, a := range elem.Attr {
 						if a.Name.Local == "lvl" {
-							para.level, _ = strconv.Atoi(a.Value)
+							n, _ := strconv.Atoi(a.Value)
+							para.level = clampListLevel(n)
 						}
 					}
 				}
@@ -307,6 +329,9 @@ func extractSlideContent(f *zip.File) (string, string, error) {
 				if tbl != nil {
 					cell := strings.Join(tbl.cell, "<br>")
 					cell = strings.ReplaceAll(cell, "|", "\\|")
+					if len(tbl.cur) >= maxTableCols {
+						return "", "", fmt.Errorf("%w: a table row has more than %d cells", ErrCorruptInput, maxTableCols)
+					}
 					tbl.cur = append(tbl.cur, cell)
 				}
 			case "tr":
@@ -315,7 +340,14 @@ func extractSlideContent(f *zip.File) (string, string, error) {
 				}
 			case "tbl":
 				if tbl != nil {
-					if md := renderPptxTable(tbl.rows); md != "" {
+					tb := newMDBuilderOn(ob)
+					if err := writeTable(tb, tbl.rows, remainingBudget(tb), tableOpts{}); err != nil {
+						tb.Discard()
+						return "", "", err
+					}
+					if tb.Len() > 0 {
+						md := tb.String()
+						tb.Discard()
 						write(md)
 					}
 					tbl = nil
@@ -328,27 +360,8 @@ func extractSlideContent(f *zip.File) (string, string, error) {
 		}
 	}
 
+	if err := body.Err(); err != nil {
+		return "", "", err
+	}
 	return title, body.String(), nil
-}
-
-func renderPptxTable(rows [][]string) string {
-	width := 0
-	for _, r := range rows {
-		if len(r) > width {
-			width = len(r)
-		}
-	}
-	if width == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for i, row := range rows {
-		cells := make([]string, width)
-		copy(cells, row)
-		sb.WriteString("| " + strings.Join(cells, " | ") + " |\n")
-		if i == 0 {
-			sb.WriteString("|" + strings.Repeat(" --- |", width) + "\n")
-		}
-	}
-	return strings.TrimRight(sb.String(), "\n")
 }

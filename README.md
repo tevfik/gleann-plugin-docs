@@ -43,6 +43,7 @@ The plugin acts as a **document structure expert** — like the AST code indexer
 |---|---|---|
 | `.pdf` | text layer (`pdftotext`); pages without text go to the page reader | `pdftoppm` for scanned pages |
 | `.docx` `.xlsx` `.pptx` `.html` `.htm` `.epub` `.csv` `.txt` `.md` `.json` | native Go parsers | nothing |
+| `.odt` `.ods` `.odp` `.rtf` | anydoc (in-process with `-tags anydoc`, otherwise the `anydoc` CLI) | `anydoc` on PATH; otherwise 503 |
 | `.xls` | native Go BIFF8 reader (values, cached formula results, ISO dates); LibreOffice only as fallback for files it rejects | nothing |
 | `.doc` `.ppt` | LibreOffice converts to OOXML, then as above | `soffice` (or `GLEANN_SOFFICE`); otherwise a clear error |
 | `.png` `.jpg` `.jpeg` `.tif` `.tiff` `.bmp` `.webp` | page reader (ONNX OCR, or the VLM) | `libonnxruntime` or `GLEANN_DOCLING_VLM=1` |
@@ -116,8 +117,27 @@ Run the HTTP server manually for testing or microservice deployment:
 
 The plugin implements Gleann's standard plugin protocol:
 
+### Authentication and access
+
+Every route, `/health` included, requires a loopback `Host` (`localhost`, `127.0.0.1`, `[::1]`, spelled in lower case; anything else gets 403, which stops DNS rebinding). Every route except `/health` also requires, when a token is configured, `Authorization: Bearer <token>` (401 otherwise). The token is the `GLEANN_PLUGIN_TOKEN` that gleann sets when it starts the plugin, or the one given with `--token` / `GLEANN_DOCS_TOKEN`; either is accepted. Without any token the plugin keeps its old open behaviour and logs a warning at startup. A reverse proxy that forwards a non-loopback `Host` gets 403.
+
+### Limits and status codes
+
+| Limit | Default | Override |
+|---|---|---|
+| upload size | 256 MB | |
+| image size (width x height) | 50 megapixels | `GLEANN_DOCS_MAX_PIXELS` |
+| zip members (docx, xlsx, pptx, epub, odt, ods, odp) | 10000 entries, 256 MiB per member, 1 GiB total, 200:1 expansion; the total also caps all zip data read during one conversion, so a member that is referenced many times is paid for each read (repeated slide, sheet and spine references are dropped; embedded pictures are read one at a time and count too); xlsx columns past XFD and rows past 1,048,576 are 422; tables wider than 16,384 columns are 422, and a table whose padded size would pass the Markdown cap is 413 before it is rendered | `GLEANN_DOCS_ZIP_MAX_ENTRIES`, `GLEANN_DOCS_ZIP_MAX_ENTRY_BYTES`, `GLEANN_DOCS_ZIP_MAX_TOTAL_BYTES` |
+| Markdown result | 64 MiB, enforced while the result is built (413 as soon as it is crossed) | `GLEANN_DOCS_MAX_MARKDOWN_BYTES` |
+
+`/convert` answers 413 for an input over a limit, 422 for a damaged file (or a missing `file` field), 503 when the format needs a backend this install lacks (scanned PDF without OCR, `.odt` without `anydoc`, `.doc` without LibreOffice), 504 when the request deadline passes, 400 for an unsupported extension.
+
+A conversion that is cancelled (the client disconnected, or the plugin is shutting down) answers 503 with an empty body, also when the cancelled child process (pdftotext, pdftoppm, LibreOffice, anydoc) reports a failure; it is never 422 or 500. A timeout answers 504. An image whose decoder panics is 422; an image over the pixel budget is 413.
+
+Temporary files live in `<temp dir>/gleann-plugin-docs-<uid>/<port>/` (the user name replaces the uid on Windows); the plugin empties the port directory at startup and when it shuts down. The per-user root must be a real directory owned by the current user and not writable by group or others; otherwise the plugin logs it, uses the system temp directory and skips the cleanup of leftovers from earlier versions (which only ever removes plain files and directories with this plugin's own names, never symbolic links). On SIGINT/SIGTERM it lets running conversions finish for `GLEANN_PLUGIN_STOP_GRACE` (default 10 s, as gleann uses) minus one second, then cancels them.
+
 ### `GET /health`
-Returns `{"status": "ok", "plugin": "gleann-plugin-docs"}`.
+Returns the plugin status and which backends are really usable, for example `{"status": "ok", "plugin": "gleann-plugin-docs", "backends": {"docling-vlm": false, "onnx-docparser": true, "pdftotext": true, "pdftoppm": true, "libreoffice": false, "anydoc": false}, "missing": [".doc", ".odt", ".ods", ".odp", ".rtf", ".ppt"]}`. `missing` lists the formats that fail for want of a backend. The status stays `ok` while the process runs. `/health` only reports state: it does not wait for a model run in progress (the VLM then counts as usable).
 
 ### `GET /info`
 Returns plugin capabilities and supported extensions:
@@ -125,7 +145,7 @@ Returns plugin capabilities and supported extensions:
 {
   "name": "gleann-plugin-docs",
   "version": "2.0.0",
-  "extensions": [".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".epub", ".html", ".htm", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".csv", ".txt", ".md"],
+  "extensions": [".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".epub", ".html", ".htm", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".odt", ".ods", ".odp", ".rtf", ".csv", ".txt", ".md"],
   "capabilities": ["document_extraction", "table_detection", "ocr"]
 }
 ```

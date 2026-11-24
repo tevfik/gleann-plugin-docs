@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential poppler-utils
+
+      - name: Build bitllm.c
+        run: |
+          cmake -B ext/bitllm.c/build -S ext/bitllm.c -DCMAKE_BUILD_TYPE=Release
+          cmake --build ext/bitllm.c/build --target bitllm_static -j$(nproc)
+
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal test)"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -timeout 10m ./...
+
+      # The allocation bounds are skipped under -race (sync.Pool drops items at
+      # random there), so they run once without it.
+      - name: Allocation bounds (no race)
+        run: go test -count=1 -timeout 10m -run 'Bounded|Capped|Share|Once|Refused' ./internal/engine

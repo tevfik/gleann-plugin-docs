@@ -27,6 +27,7 @@ func main() {
 	portFlag := flag.Int("port", 8765, "HTTP server port")
 	modelFlag := flag.String("model", "", "Path to granite_docling_bitnet_dense.eifm")
 	tokenizerFlag := flag.String("tokenizer", "", "Path to tokenizer.bin")
+	tokenFlag := flag.String("token", "", "Bearer token clients must present (also GLEANN_DOCS_TOKEN; the gleann host sets GLEANN_PLUGIN_TOKEN)")
 	installFlag := flag.Bool("install", false, "Register plugin into ~/.gleann/plugins.json")
 	versionFlag := flag.Bool("version", false, "Show plugin version and exit")
 
@@ -220,7 +221,11 @@ func main() {
 		}
 
 		srv := httpserver.New(eng, *portFlag)
+		if *tokenFlag != "" {
+			srv.SetToken(*tokenFlag)
+		}
 		defer srv.Close()
+		grace := stopGrace(os.Getenv("GLEANN_PLUGIN_STOP_GRACE"))
 
 		// SIGINT/SIGTERM: stop accepting requests, let running conversions finish
 		// (they remove their temporary files), then exit 0.
@@ -231,7 +236,7 @@ func main() {
 			defer close(shutdownDone)
 			<-sigCh
 			log.Println("[gleann-plugin-docs] Shutting down...")
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), drainTimeout(grace))
 			defer cancel()
 			if err := srv.Shutdown(ctx); err != nil {
 				log.Printf("[gleann-plugin-docs] shutdown: %v", err)
@@ -244,12 +249,37 @@ func main() {
 		// Serve returns as soon as Shutdown starts; wait for it to finish.
 		select {
 		case <-shutdownDone:
-		case <-time.After(25 * time.Second):
+		case <-time.After(grace):
 		}
 		return
 	}
 
 	flag.Usage()
+}
+
+// defaultStopGrace is the time gleann gives a plugin to exit after SIGINT
+// before it kills it (pkg/gleann/plugin.go defaultPluginStopGrace).
+const defaultStopGrace = 10 * time.Second
+
+// stopGrace parses GLEANN_PLUGIN_STOP_GRACE the way the host does: a positive
+// Go duration, otherwise the default.
+func stopGrace(env string) time.Duration {
+	if env != "" {
+		if d, err := time.ParseDuration(env); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultStopGrace
+}
+
+// drainTimeout is how long running conversions may finish after SIGINT: the
+// host's grace minus one second, which the server uses to cancel what is still
+// running and remove its temporary files before the host kills the process.
+func drainTimeout(grace time.Duration) time.Duration {
+	if d := grace - time.Second; d >= grace/2 {
+		return d
+	}
+	return grace / 2
 }
 
 func installPlugin(port int) error {

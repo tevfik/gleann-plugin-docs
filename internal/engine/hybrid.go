@@ -199,7 +199,10 @@ func decodeImage(path string) (image.Image, error) {
 		return nil, err
 	}
 	defer f.Close()
-	img, _, err := image.Decode(f)
+	if err := checkImageConfig(f, MaxPixels()); err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)
+	}
+	img, err := decodeImageSafe(f)
 	if err != nil {
 		return nil, fmt.Errorf("decoding %s: %w", filepath.Base(path), err)
 	}
@@ -218,7 +221,7 @@ func (d *eifDeep) Recognize(ctx context.Context, page image.Image, box docparser
 		return "", err
 	}
 
-	tmp, err := os.CreateTemp("", "gleann_deep_*.png")
+	tmp, err := os.CreateTemp(TempDir(), "gleann_deep_*.png")
 	if err != nil {
 		return "", err
 	}

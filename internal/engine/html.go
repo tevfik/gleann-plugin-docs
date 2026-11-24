@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -13,32 +14,53 @@ import (
 
 // ExtractHTMLFile reads an HTML file and converts its readable content to clean Markdown.
 func ExtractHTMLFile(filePath string) (string, error) {
+	return extractHTMLFile(newOutBudget(), filePath)
+}
+
+func extractHTMLFile(ob *outBudget, filePath string) (string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", fmt.Errorf("read html file %s: %w", filePath, err)
 	}
-	return ExtractHTML(bytes.NewReader(data))
+	return extractHTML(ob, bytes.NewReader(data))
 }
 
 // ExtractHTML parses HTML from an io.Reader and converts it to Markdown.
-func ExtractHTML(r io.Reader) (string, error) {
+func ExtractHTML(r io.Reader) (string, error) { return extractHTML(newOutBudget(), r) }
+
+// extractHTML converts r drawing every buffer (document, list item, cell, link
+// and quote fragments) on ob. The converted text is charged to ob on return.
+func extractHTML(ob *outBudget, r io.Reader) (string, error) {
 	doc, err := nethtml.Parse(r)
 	if err != nil {
 		return "", fmt.Errorf("parse html: %w", err)
 	}
 
-	var sb strings.Builder
+	sb := newMDBuilderOn(ob)
+	var failed error
 	conv := &htmlConverter{
-		buf: &sb,
+		buf: sb,
+		err: &failed,
 	}
 	conv.walk(doc)
+	if failed != nil {
+		return "", failed
+	}
+	if err := sb.Err(); err != nil {
+		return "", err
+	}
 
 	res := cleanMarkdown(sb.String())
+	sb.Discard()
+	if err := chargeText(ob, res); err != nil {
+		return "", err
+	}
 	return res, nil
 }
 
 type htmlConverter struct {
-	buf       *strings.Builder
+	err       *error // first table error, shared with nested converters
+	buf       *mdBuilder
 	inPre     bool
 	listStack []listState
 }
@@ -50,6 +72,10 @@ type listState struct {
 
 func (c *htmlConverter) walk(n *nethtml.Node) {
 	if n == nil {
+		return
+	}
+	// After the first refusal (budget or table size) nothing more is rendered.
+	if c.buf.ob.err != nil || (c.err != nil && *c.err != nil) {
 		return
 	}
 
@@ -134,10 +160,11 @@ func (c *htmlConverter) walk(n *nethtml.Node) {
 
 		case "blockquote":
 			c.ensureNewline()
-			var inner strings.Builder
-			innerConv := &htmlConverter{buf: &inner, inPre: c.inPre}
+			inner := newMDBuilderOn(c.buf.ob)
+			innerConv := &htmlConverter{err: c.err, buf: inner, inPre: c.inPre}
 			innerConv.walkChildren(n)
 			lines := strings.Split(strings.TrimSpace(inner.String()), "\n")
+			inner.Discard()
 			for _, line := range lines {
 				c.buf.WriteString("> " + line + "\n")
 			}
@@ -158,7 +185,7 @@ func (c *htmlConverter) walk(n *nethtml.Node) {
 			c.buf.WriteString("\n")
 
 		case "li":
-			indent := strings.Repeat("  ", max(0, len(c.listStack)-1))
+			indent := strings.Repeat("  ", clampListLevel(len(c.listStack)-1))
 			prefix := "- "
 			if len(c.listStack) > 0 && c.listStack[len(c.listStack)-1].ordered {
 				curr := &c.listStack[len(c.listStack)-1]
@@ -167,17 +194,20 @@ func (c *htmlConverter) walk(n *nethtml.Node) {
 			}
 			c.ensureNewline()
 			c.buf.WriteString(indent + prefix)
-			var itemBuf strings.Builder
-			itemConv := &htmlConverter{buf: &itemBuf, inPre: c.inPre, listStack: c.listStack}
+			itemBuf := newMDBuilderOn(c.buf.ob)
+			itemConv := &htmlConverter{err: c.err, buf: itemBuf, inPre: c.inPre, listStack: c.listStack}
 			itemConv.walkChildren(n)
-			c.buf.WriteString(strings.TrimSpace(itemBuf.String()) + "\n")
+			item := strings.TrimSpace(itemBuf.String())
+			itemBuf.Discard()
+			c.buf.WriteString(item + "\n")
 
 		case "a":
 			href := getAttr(n, "href")
-			var linkText strings.Builder
-			textConv := &htmlConverter{buf: &linkText, inPre: c.inPre}
+			linkText := newMDBuilderOn(c.buf.ob)
+			textConv := &htmlConverter{err: c.err, buf: linkText, inPre: c.inPre}
 			textConv.walkChildren(n)
 			txt := strings.TrimSpace(linkText.String())
+			linkText.Discard()
 			if href != "" && txt != "" {
 				c.buf.WriteString(fmt.Sprintf("[%s](%s)", txt, href))
 			} else if txt != "" {
@@ -220,6 +250,7 @@ func (c *htmlConverter) ensureNewline() {
 
 func (c *htmlConverter) renderTable(tableNode *nethtml.Node) {
 	var rows [][]string
+	held := 0 // cell text kept in rows, charged until the table is written
 	var findRows func(*nethtml.Node)
 	findRows = func(n *nethtml.Node) {
 		if n.Type == nethtml.ElementNode && strings.ToLower(n.Data) == "tr" {
@@ -228,11 +259,15 @@ func (c *htmlConverter) renderTable(tableNode *nethtml.Node) {
 				if cell.Type == nethtml.ElementNode {
 					tag := strings.ToLower(cell.Data)
 					if tag == "td" || tag == "th" {
-						var cellBuf strings.Builder
-						cellConv := &htmlConverter{buf: &cellBuf}
+						cellBuf := newMDBuilderOn(c.buf.ob)
+						cellConv := &htmlConverter{err: c.err, buf: cellBuf}
 						cellConv.walkChildren(cell)
 						// In markdown table cells, replace newlines and pipes
 						cellText := strings.TrimSpace(cellBuf.String())
+						cellBuf.Discard()
+						if err := c.buf.ob.take(len(cellText)); err == nil { // the kept cell text is charged until the table is written
+							held += len(cellText)
+						}
 						cellText = strings.ReplaceAll(cellText, "|", "\\|")
 						cellText = strings.ReplaceAll(cellText, "\n", " ")
 						row = append(row, cellText)
@@ -249,40 +284,20 @@ func (c *htmlConverter) renderTable(tableNode *nethtml.Node) {
 		}
 	}
 	findRows(tableNode)
+	c.buf.ob.give(held)
 
 	if len(rows) == 0 {
 		return
 	}
 
-	maxCols := 0
-	for _, r := range rows {
-		if len(r) > maxCols {
-			maxCols = len(r)
+	// Pad, project and render through the shared table writer.
+	if err := writeTable(c.buf, rows, remainingBudget(c.buf), tableOpts{trailingNewline: true}); err != nil {
+		if errors.Is(err, ErrTooLarge) && c.buf.ob.err == nil {
+			c.buf.ob.err = err // sticky: the rest of the conversion is refused too
 		}
-	}
-	if maxCols == 0 {
-		return
-	}
-
-	// Pad rows to maxCols
-	for i := range rows {
-		for len(rows[i]) < maxCols {
-			rows[i] = append(rows[i], "")
+		if c.err != nil && *c.err == nil {
+			*c.err = err
 		}
-	}
-
-	// Render Header Row
-	c.buf.WriteString("| " + strings.Join(rows[0], " | ") + " |\n")
-	// Render Separator
-	seps := make([]string, maxCols)
-	for i := range seps {
-		seps[i] = "---"
-	}
-	c.buf.WriteString("| " + strings.Join(seps, " | ") + " |\n")
-
-	// Render Data Rows
-	for _, r := range rows[1:] {
-		c.buf.WriteString("| " + strings.Join(r, " | ") + " |\n")
 	}
 }
 

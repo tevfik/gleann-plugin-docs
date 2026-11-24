@@ -55,7 +55,11 @@ type biffRecord struct {
 func (r *biffRecord) body() []byte { return r.chunks[0] }
 
 // ExtractXLS converts a legacy .xls workbook to markdown, one table per worksheet.
-func ExtractXLS(filePath string) (md string, sheets int, err error) {
+func ExtractXLS(filePath string) (string, int, error) {
+	return extractXLS(newOutBudget(), filePath)
+}
+
+func extractXLS(ob *outBudget, filePath string) (md string, sheets int, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			md, sheets, err = "", 0, fmt.Errorf("xls: malformed workbook: %v", r)
@@ -90,7 +94,7 @@ func ExtractXLS(filePath string) (md string, sheets int, err error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("xls: %w", err)
 	}
-	return parseBIFF8(stream)
+	return parseBIFF8(ob, stream)
 }
 
 func readBIFFRecords(b []byte) []biffRecord {
@@ -127,7 +131,7 @@ type xlsBook struct {
 	sheets   []xlsSheetInfo
 }
 
-func parseBIFF8(stream []byte) (string, int, error) {
+func parseBIFF8(ob *outBudget, stream []byte) (string, int, error) {
 	recs := readBIFFRecords(stream)
 	if len(recs) == 0 || recs[0].id != biffBOF || len(recs[0].body()) < 2 {
 		return "", 0, fmt.Errorf("xls: no BIFF stream")
@@ -171,16 +175,21 @@ func parseBIFF8(stream []byte) (string, int, error) {
 		}
 	}
 
-	var sb strings.Builder
+	sb := newMDBuilderOn(ob)
+	done := map[int]bool{} // a worksheet listed by several BOUNDSHEET records is rendered once
 	for i, si := range bk.sheets {
 		if si.kind != 0 { // worksheets only, no charts or macro sheets
 			continue
 		}
 		start, ok := byOff[si.off]
-		if !ok {
+		if !ok || done[si.off] {
 			continue
 		}
-		table := rowsToMarkdown(bk.readSheet(recs[start:]))
+		done[si.off] = true
+		table, err := rowsToMarkdown(ob, bk.readSheet(recs[start:]))
+		if err != nil {
+			return "", 0, err
+		}
 		if strings.TrimSpace(table) == "" {
 			continue
 		}
@@ -188,7 +197,10 @@ func parseBIFF8(stream []byte) (string, int, error) {
 		if name == "" {
 			name = fmt.Sprintf("Sheet %d", i+1)
 		}
-		fmt.Fprintf(&sb, "## %s\n\n%s\n\n", name, table)
+		fmt.Fprintf(sb, "## %s\n\n%s\n\n", name, table)
+		if err := sb.Err(); err != nil {
+			return "", 0, err
+		}
 	}
 	return strings.TrimSpace(sb.String()), len(bk.sheets), nil
 }

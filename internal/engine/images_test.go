@@ -82,7 +82,7 @@ func TestListEmbeddedImagesSkipsSmallAndUndecodable(t *testing.T) {
 	add("word/other/image3.png", enc(solid(400, 300)))
 	zw.Close()
 	f.Close()
-	got, err := listEmbeddedImages(p, "word/media")
+	got, err := collectEmbedded(p, "word/media")
 	if err != nil || len(got) != 1 || got[0].Name != "image1.png" {
 		t.Fatalf("got %v err %v", got, err)
 	}

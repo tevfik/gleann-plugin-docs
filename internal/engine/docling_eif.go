@@ -109,6 +109,7 @@ static char *c_generate_page(eif_llm_t *llm, const eif_llm_vision_input_t *vin, 
 import "C"
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -135,6 +136,9 @@ type EIFDoclingEngine struct {
 	mu            sync.Mutex
 	hybrid        pageParser // ONNX page parser (docparser or Indra): table pages of digital PDFs, OCR fallback
 	vlmFailed     bool       // lazy VLM load failed once; do not retry per page
+
+	tools    toolCache                    // cached PATH lookups for BackendStatus
+	lookPath func(string) (string, error) // exec.LookPath unless a test replaces it
 }
 
 // NewEIFDoclingEngine initializes the CGO eif-runtime model engine.
@@ -168,7 +172,7 @@ func (e *EIFDoclingEngine) loadModelLocked() error {
 		return nil
 	}
 	if e.modelPath == "" {
-		return fmt.Errorf("no docling model found (checked --model, GLEANN_DOCLING_MODEL, and ~/.gleann/models)")
+		return fmt.Errorf("%w: no docling model found (checked --model, GLEANN_DOCLING_MODEL, and ~/.gleann/models)", ErrBackendUnavailable)
 	}
 
 	configureThreads()
@@ -196,7 +200,7 @@ func (e *EIFDoclingEngine) IsAvailable() bool {
 	if e == nil {
 		return false
 	}
-	return e.hybrid != nil || e.vlmUsable()
+	return e.hybrid != nil || e.vlmStatus()
 }
 
 // vlmUsable reports whether the VLM is loaded or can still be loaded on demand:
@@ -204,6 +208,17 @@ func (e *EIFDoclingEngine) IsAvailable() bool {
 // and no earlier load failure.
 func (e *EIFDoclingEngine) vlmUsable() bool {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.vlmUsableLocked()
+}
+
+// vlmStatus is vlmUsable for status reporting: it never waits. A model run
+// holds e.mu for its whole duration (and means the model is loaded), so when
+// the lock is taken the answer is "usable".
+func (e *EIFDoclingEngine) vlmStatus() bool {
+	if !e.mu.TryLock() {
+		return true
+	}
 	defer e.mu.Unlock()
 	return e.vlmUsableLocked()
 }
@@ -238,14 +253,37 @@ func (e *EIFDoclingEngine) Close() error {
 	return nil
 }
 
-// Convert processes an input file (PDF, image, or text) to Markdown.
+// Convert processes an input file (PDF, image, or text) to Markdown. Size
+// limits on untrusted input are checked first, and failures are tagged with
+// ErrCorruptInput, ErrBackendUnavailable or ErrTooLarge when the cause is known.
 func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string, int, error) {
+	if err := preflight(filePath); err != nil {
+		return "", 0, err
+	}
+	ctx, _ = budgetFrom(ctx) // one output budget for the whole conversion
+	md, pages, err := e.convert(ctx, filePath)
+	if err != nil {
+		// A child that died because the request was cancelled (client gone,
+		// shutdown) or timed out is not damaged input: keep the context error
+		// in the chain so the server answers 503/504, not 422 or 500.
+		if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+			return "", 0, fmt.Errorf("%w: %w", cerr, err)
+		}
+		return "", 0, classifyError(err)
+	}
+	return md, pages, nil
+}
+
+func (e *EIFDoclingEngine) convert(ctx context.Context, filePath string) (string, int, error) {
 	ext := strings.ToLower(filepath.Ext(filePath))
+	_, ob := budgetFrom(ctx)
 
 	// .xls: read natively; LibreOffice is only the fallback for files the native reader rejects.
 	if ext == ".xls" {
-		if md, sheets, err := ExtractXLS(filePath); err == nil && md != "" {
+		if md, sheets, err := extractXLS(ob, filePath); err == nil && md != "" {
 			return md, sheets, nil
+		} else if errors.Is(err, ErrTooLarge) || errors.Is(err, ErrCorruptInput) {
+			return "", 0, err
 		} else if err != nil {
 			log.Printf("[docling-eif] native .xls reader failed (%v), trying LibreOffice", err)
 		}
@@ -268,48 +306,67 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 		if err != nil {
 			return "", 0, err
 		}
+		if err := ob.take(len(b)); err != nil {
+			return "", 0, err
+		}
 		return string(b), 1, nil
 	case ".odt", ".ods", ".odp", ".rtf":
 		md, err := convertAnyDoc(ctx, filePath)
 		if err != nil {
 			return "", 0, fmt.Errorf("conversion failed: %w", err)
 		}
+		if err := chargeText(ob, md); err != nil {
+			return "", 0, err
+		}
 		return md, 1, nil
 	case ".docx":
 		if md, err := convertAnyDoc(ctx, filePath); err == nil && md != "" {
-			return e.appendEmbeddedImageText(ctx, md, filePath, "word/media"), 1, nil
+			if err := chargeText(ob, md); err != nil {
+				return "", 0, err
+			}
+			md, err := e.appendEmbeddedImageText(ctx, md, filePath, "word/media")
+			return md, 1, err
 		}
-		md, err := ExtractDocx(filePath)
+		md, err := extractDocx(ob, filePath)
 		if err != nil {
 			return "", 0, err
 		}
-		return e.appendEmbeddedImageText(ctx, md, filePath, "word/media"), 1, nil
+		md, err = e.appendEmbeddedImageText(ctx, md, filePath, "word/media")
+		return md, 1, err
 	case ".pptx":
 		if md, err := convertAnyDoc(ctx, filePath); err == nil && md != "" {
-			return e.appendEmbeddedImageText(ctx, md, filePath, "ppt/media"), 1, nil
+			if err := chargeText(ob, md); err != nil {
+				return "", 0, err
+			}
+			md, err := e.appendEmbeddedImageText(ctx, md, filePath, "ppt/media")
+			return md, 1, err
 		}
-		md, pages, err := ExtractPPTX(filePath)
+		md, pages, err := extractPPTX(ob, filePath)
 		if err != nil {
 			return "", 0, err
 		}
-		return e.appendEmbeddedImageText(ctx, md, filePath, "ppt/media"), pages, nil
+		md, err = e.appendEmbeddedImageText(ctx, md, filePath, "ppt/media")
+		return md, pages, err
 	case ".xlsx":
 		if md, err := convertAnyDoc(ctx, filePath); err == nil && md != "" {
+			if err := chargeText(ob, md); err != nil {
+				return "", 0, err
+			}
 			return md, 1, nil
 		}
-		md, sheets, err := ExtractXLSX(filePath)
+		md, sheets, err := extractXLSX(ob, filePath)
 		if err != nil {
 			return "", 0, err
 		}
 		return md, sheets, nil
 	case ".html", ".htm":
-		md, err := ExtractHTMLFile(filePath)
+		md, err := extractHTMLFile(ob, filePath)
 		if err != nil {
 			return "", 0, err
 		}
 		return md, 1, nil
 	case ".epub":
-		md, chapters, err := ExtractEPUB(filePath)
+		md, chapters, err := extractEPUB(ob, filePath)
 		if err != nil {
 			return "", 0, err
 		}
@@ -327,6 +384,9 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 		if err != nil {
 			return "", 0, err
 		}
+		if err := chargeText(ob, md); err != nil {
+			return "", 0, err
+		}
 		return md, 1, nil
 	}
 
@@ -335,6 +395,9 @@ func (e *EIFDoclingEngine) Convert(ctx context.Context, filePath string) (string
 	case ".png", ".jpg", ".jpeg":
 		md, err := e.convertPage(ctx, filePath)
 		if err != nil {
+			return "", 0, err
+		}
+		if err := chargeText(ob, md); err != nil {
 			return "", 0, err
 		}
 		return md, 1, nil
@@ -510,7 +573,7 @@ func renderPDFPages(ctx context.Context, pdfPath string, first, last int) ([]str
 
 // renderPDFPagesDPI is renderPDFPages at an explicit resolution.
 func renderPDFPagesDPI(ctx context.Context, pdfPath string, first, last, dpi int) ([]string, func(), error) {
-	tmpDir, err := os.MkdirTemp("", "gleann_docling_pdf_*")
+	tmpDir, err := os.MkdirTemp(TempDir(), "gleann_docling_pdf_*")
 	if err != nil {
 		return nil, func() {}, err
 	}
@@ -532,6 +595,13 @@ func renderPDFPagesDPI(ctx context.Context, pdfPath string, first, last, dpi int
 		return nil, func() {}, fmt.Errorf("no page images generated by pdftoppm")
 	}
 	sort.Slice(matches, func(i, j int) bool { return extractPageNumber(matches[i]) < extractPageNumber(matches[j]) })
+	// A page with a huge MediaBox renders to a huge PNG; refuse it before any decoder allocates for it.
+	for _, m := range matches {
+		if err := checkImageFile(m); err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+	}
 	return matches, cleanup, nil
 }
 
@@ -548,6 +618,7 @@ func renderPDFPagesDPI(ctx context.Context, pdfPath string, first, last, dpi int
 //
 // A scanned page that nothing can read is skipped with a warning.
 func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (string, int, error) {
+	_, ob := budgetFrom(ctx)
 	force := envTrue("GLEANN_DOCLING_FORCE_VLM")
 
 	pages, err := pdfPageTexts(ctx, pdfPath)
@@ -596,6 +667,9 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 					log.Printf("[docling-eif] warning: failed page %d: %v", idx+1, errs[k])
 					continue
 				}
+				if err := chargeText(ob, mds[k]); err != nil {
+					return "", 0, err
+				}
 				result[idx] = mds[k]
 			}
 		}
@@ -608,7 +682,11 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 			continue
 		}
 		if nonSpaceChars(t) >= minPageTextChars {
-			result[i] = promoteNumberedHeadings(e.readDigitalPage(ctx, pdfPath, i+1, strings.TrimSpace(t)))
+			page := promoteNumberedHeadings(e.readDigitalPage(ctx, pdfPath, i+1, strings.TrimSpace(t)))
+			if err := chargeText(ob, page); err != nil {
+				return "", 0, err
+			}
+			result[i] = page
 			continue
 		}
 		if !e.canReadScanned() {
@@ -629,6 +707,9 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 			log.Printf("[docling-eif] warning: failed page %d: %v", i+1, err)
 			continue
 		}
+		if err := chargeText(ob, md); err != nil {
+			return "", 0, err
+		}
 		result[i] = md
 	}
 	if len(skipped) > 0 {
@@ -642,9 +723,13 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 		}
 	}
 	if len(kept) == 0 {
-		return "", 0, fmt.Errorf("no extractable text in %s: scanned PDF and no OCR/VLM available (set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
+		return "", 0, fmt.Errorf("%w: no extractable text in %s: scanned PDF and no OCR/VLM available (set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", ErrBackendUnavailable, filepath.Base(pdfPath))
 	}
-	return strings.Join(kept, "\n\n"), len(pages), nil
+	joined, err := joinBudgeted(ob, kept, "\n\n")
+	if err != nil {
+		return "", 0, err
+	}
+	return joined, len(pages), nil
 }
 
 // readDigitalPage returns the Markdown of a page that has a text layer. The
@@ -681,6 +766,7 @@ func (e *EIFDoclingEngine) readDigitalPage(ctx context.Context, pdfPath string, 
 }
 
 func (e *EIFDoclingEngine) convertPDFAllVLM(ctx context.Context, pdfPath string) (string, int, error) {
+	_, ob := budgetFrom(ctx)
 	if !e.canReadScanned() {
 		return "", 0, fmt.Errorf("cannot read %s: no text layer available and neither OCR nor the VLM is available (set GLEANN_DOCLING_ONNX=1 or GLEANN_DOCLING_VLM=1)", filepath.Base(pdfPath))
 	}
@@ -702,6 +788,9 @@ func (e *EIFDoclingEngine) convertPDFAllVLM(ctx context.Context, pdfPath string)
 				log.Printf("[docling-eif] warning: failed page %s: %v", imgs[i], errs[i])
 				continue
 			}
+			if err := chargeText(ob, md); err != nil {
+				return "", 0, err
+			}
 			pageMarkdowns = append(pageMarkdowns, md)
 		}
 	}
@@ -717,12 +806,19 @@ func (e *EIFDoclingEngine) convertPDFAllVLM(ctx context.Context, pdfPath string)
 			log.Printf("[docling-eif] warning: failed page %s: %v", img, err)
 			continue
 		}
+		if err := chargeText(ob, md); err != nil {
+			return "", 0, err
+		}
 		pageMarkdowns = append(pageMarkdowns, md)
 	}
 	if len(pageMarkdowns) == 0 {
 		return "", 0, fmt.Errorf("no content extracted from pdf pages")
 	}
-	return strings.Join(pageMarkdowns, "\n\n---\n\n"), len(imgs), nil
+	joined, err := joinBudgeted(ob, pageMarkdowns, "\n\n---\n\n")
+	if err != nil {
+		return "", 0, err
+	}
+	return joined, len(imgs), nil
 }
 
 func extractPageNumber(path string) int {

@@ -2,7 +2,9 @@ package engine
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -40,7 +42,7 @@ func toTempPNG(src string) (string, func(), error) {
 }
 
 func writeTempPNG(img image.Image) (string, func(), error) {
-	f, err := os.CreateTemp("", "gleann-img-*.png")
+	f, err := os.CreateTemp(TempDir(), "gleann-img-*.png")
 	if err != nil {
 		return "", nil, err
 	}
@@ -63,12 +65,17 @@ type embeddedImage struct {
 	Img  image.Image
 }
 
-// listEmbeddedImages returns the decodable pictures under mediaDir ("word/media",
-// "ppt/media") in name order. EMF/WMF/SVG and anything undecodable are skipped.
-func listEmbeddedImages(zipPath, mediaDir string) ([]embeddedImage, error) {
+// forEachEmbeddedImage calls fn with every decodable picture under mediaDir
+// ("word/media", "ppt/media") in name order, one at a time: an image is read,
+// decoded, handed to fn and released before the next one is touched, so memory
+// stays at one decoded picture. EMF/WMF/SVG, tiny icons and anything
+// undecodable are skipped. Member reads are charged to the conversion's zip
+// budget; when it is exhausted the walk stops with ErrTooLarge. fn returns
+// false to stop early.
+func forEachEmbeddedImage(zipPath, mediaDir string, fn func(embeddedImage) bool) error {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer r.Close()
 	var names []*zip.File
@@ -78,63 +85,98 @@ func listEmbeddedImages(zipPath, mediaDir string) ([]embeddedImage, error) {
 		}
 	}
 	sort.Slice(names, func(i, j int) bool { return names[i].Name < names[j].Name })
-	var out []embeddedImage
+	budget := newZipBudget()
+	seen := 0
 	for _, f := range names {
-		if len(out) >= maxEmbeddedImages {
+		if seen >= maxEmbeddedImages {
 			log.Printf("[docling-eif] %s: only the first %d embedded images are read", filepath.Base(zipPath), maxEmbeddedImages)
 			break
 		}
-		rc, err := f.Open()
+		img, ok, err := readEmbeddedImage(budget, f, zipPath)
 		if err != nil {
+			return err
+		}
+		if !ok {
 			continue
 		}
-		img, _, err := image.Decode(io.LimitReader(rc, 64<<20))
-		rc.Close()
-		if err != nil {
-			continue
+		seen++
+		if !fn(embeddedImage{Name: path.Base(f.Name), Img: img}) {
+			break
 		}
-		b := img.Bounds()
-		if b.Dx() < minEmbeddedSide || b.Dy() < minEmbeddedSide {
-			continue
-		}
-		out = append(out, embeddedImage{Name: path.Base(f.Name), Img: img})
 	}
-	return out, nil
+	return nil
+}
+
+// readEmbeddedImage decodes one member. ok is false for a member to skip; err
+// is only ErrTooLarge from the zip budget.
+func readEmbeddedImage(budget *zipBudget, f *zip.File, zipPath string) (image.Image, bool, error) {
+	rc, err := openEntry(budget, f)
+	if err != nil {
+		return nil, false, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(rc, 64<<20))
+	rc.Close()
+	if errors.Is(err, ErrTooLarge) {
+		return nil, false, err
+	}
+	if err != nil {
+		return nil, false, nil
+	}
+	rd := bytes.NewReader(data)
+	if err := checkImageConfig(rd, MaxPixels()); err != nil {
+		if errors.Is(err, ErrTooLarge) {
+			log.Printf("[docling-eif] %s: embedded image %s skipped: %v", filepath.Base(zipPath), path.Base(f.Name), err)
+		}
+		return nil, false, nil
+	}
+	img, err := decodeImageSafe(rd)
+	if err != nil {
+		return nil, false, nil
+	}
+	if bd := img.Bounds(); bd.Dx() < minEmbeddedSide || bd.Dy() < minEmbeddedSide {
+		return nil, false, nil
+	}
+	return img, true, nil
 }
 
 // appendEmbeddedImageText reads the pictures inside an Office file with the
 // page reader (ONNX OCR or the VLM) and appends their text as extra sections.
 // Without a reader, or when nothing is found, md is returned unchanged.
-func (e *EIFDoclingEngine) appendEmbeddedImageText(ctx context.Context, md, zipPath, mediaDir string) string {
+func (e *EIFDoclingEngine) appendEmbeddedImageText(ctx context.Context, md, zipPath, mediaDir string) (string, error) {
 	if !e.canReadScanned() {
-		return md
+		return md, nil
 	}
-	imgs, err := listEmbeddedImages(zipPath, mediaDir)
-	if err != nil || len(imgs) == 0 {
-		return md
-	}
-	var b strings.Builder
-	b.WriteString(md)
+	// md is already charged to the conversion budget; the text read from the
+	// pictures draws on the same one.
+	_, ob := budgetFrom(ctx)
+	b := newMDBuilderOn(ob)
 	n := 0
-	for _, im := range imgs {
+	err := forEachEmbeddedImage(zipPath, mediaDir, func(im embeddedImage) bool {
 		if ctx.Err() != nil {
-			break
+			return false
 		}
 		tmp, cleanup, err := writeTempPNG(im.Img)
 		if err != nil {
-			continue
+			return true
 		}
 		text, err := e.convertPage(ctx, tmp)
 		cleanup()
 		text = strings.TrimSpace(text)
 		if err != nil || text == "" {
-			continue
+			return true
 		}
 		n++
-		fmt.Fprintf(&b, "\n\n## Embedded image: %s\n\n%s\n", im.Name, text)
+		fmt.Fprintf(b, "\n\n## Embedded image: %s\n\n%s\n", im.Name, text)
+		return true
+	})
+	if err != nil {
+		log.Printf("[docling-eif] %s: embedded images: %v", filepath.Base(zipPath), err)
 	}
 	if n > 0 {
 		log.Printf("[docling-eif] %s: read text from %d embedded image(s)", filepath.Base(zipPath), n)
 	}
-	return b.String()
+	if err := b.Err(); err != nil {
+		return "", err
+	}
+	return md + b.String(), nil
 }

@@ -69,6 +69,9 @@ func promoteNumberedHeadings(text string) string {
 				}
 			}
 			if !list {
+				if d > 5 {
+					d = 5 // deepest Markdown heading is ######
+				}
 				lines[i] = strings.Repeat("#", d+1) + " " + t
 				prevIsBoundary = true
 				continue

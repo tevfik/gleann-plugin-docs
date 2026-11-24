@@ -21,6 +21,9 @@ import (
 // HasInProcessAnyDoc reports true because this binary was built with in-process anydoc support.
 const HasInProcessAnyDoc = true
 
+// anyDocAvailable is always true: anydoc is linked into this binary.
+func anyDocAvailable(func(string) (string, error)) bool { return true }
+
 func convertAnyDoc(ctx context.Context, filePath string) (string, error) {
 	if _, err := os.Stat(filePath); err != nil {
 		return "", err

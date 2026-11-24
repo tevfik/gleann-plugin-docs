@@ -226,7 +226,7 @@ func TestSettingsEndpoint(t *testing.T) {
 	// A request addressed to another host name (DNS rebinding) is refused.
 	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/settings", nil)
 	req.Host = "evil.example:8765"
-	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusUnauthorized {
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusForbidden {
 		t.Errorf("foreign Host: %v %v", resp, err)
 	}
 }

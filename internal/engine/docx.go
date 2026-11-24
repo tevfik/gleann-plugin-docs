@@ -11,7 +11,9 @@ import (
 )
 
 // ExtractDocx reads word/document.xml from a .docx file and produces Markdown.
-func ExtractDocx(filePath string) (string, error) {
+func ExtractDocx(filePath string) (string, error) { return extractDocx(newOutBudget(), filePath) }
+
+func extractDocx(ob *outBudget, filePath string) (string, error) {
 	r, err := zip.OpenReader(filePath)
 	if err != nil {
 		return "", fmt.Errorf("open docx zip: %w", err)
@@ -31,21 +33,22 @@ func ExtractDocx(filePath string) (string, error) {
 		return "", fmt.Errorf("word/document.xml not found in %s", filePath)
 	}
 
+	budget := newZipBudget()
 	var styles map[string]int
 	if stylesFile != nil {
-		if rc, err := stylesFile.Open(); err == nil {
+		if rc, err := openEntry(budget, stylesFile); err == nil {
 			styles = parseHeadingStyles(rc)
 			rc.Close()
 		}
 	}
 
-	rc, err := docFile.Open()
+	rc, err := openEntry(budget, docFile)
 	if err != nil {
 		return "", fmt.Errorf("open word/document.xml: %w", err)
 	}
 	defer rc.Close()
 
-	return parseDocumentXMLWithStyles(rc, styles)
+	return parseDocumentXMLWithStyles(ob, rc, styles)
 }
 
 var (
@@ -127,10 +130,10 @@ type docxTable struct {
 	maxCols int
 }
 
-func parseDocumentXMLWithStyles(r io.Reader, styles map[string]int) (string, error) {
+func parseDocumentXMLWithStyles(ob *outBudget, r io.Reader, styles map[string]int) (string, error) {
 	decoder := xml.NewDecoder(r)
 
-	var sb strings.Builder
+	sb := newMDBuilderOn(ob)
 	var paras []*docxPara
 	var tbl *docxTable // outermost table; nested tables are flattened into the cell
 	var inT bool
@@ -169,21 +172,15 @@ func parseDocumentXMLWithStyles(r io.Reader, styles map[string]int) (string, err
 		}
 	}
 
-	flushTable := func(t *docxTable) {
+	flushTable := func(t *docxTable) error {
 		if len(t.rows) == 0 {
-			return
+			return nil
 		}
-		var tb strings.Builder
-		for i, row := range t.rows {
-			for len(row) < t.maxCols {
-				row = append(row, "")
-			}
-			tb.WriteString("| " + strings.Join(row, " | ") + " |\n")
-			if i == 0 {
-				tb.WriteString("|" + strings.Repeat(" --- |", t.maxCols) + "\n")
-			}
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
 		}
-		writeBlock(strings.TrimRight(tb.String(), "\n"))
+		prevWasList = false
+		return writeTable(sb, t.rows, remainingBudget(sb), tableOpts{})
 	}
 
 	cur := func() *docxPara {
@@ -255,7 +252,8 @@ func parseDocumentXMLWithStyles(r io.Reader, styles map[string]int) (string, err
 				if p := cur(); p != nil {
 					for _, a := range elem.Attr {
 						if a.Name.Local == "val" {
-							p.listLvl, _ = strconv.Atoi(a.Value)
+							n, _ := strconv.Atoi(a.Value)
+							p.listLvl = clampListLevel(n)
 						}
 					}
 				}
@@ -281,6 +279,9 @@ func parseDocumentXMLWithStyles(r io.Reader, styles map[string]int) (string, err
 				if tbl != nil && tbl.depth == 1 {
 					cell := strings.Join(tbl.cell, "<br>")
 					cell = strings.ReplaceAll(cell, "|", "\\|")
+					if len(tbl.cur) >= maxTableCols {
+						return "", fmt.Errorf("%w: a table row has more than %d cells", ErrCorruptInput, maxTableCols)
+					}
 					tbl.cur = append(tbl.cur, cell)
 					tbl.inCell = false
 				}
@@ -295,8 +296,11 @@ func parseDocumentXMLWithStyles(r io.Reader, styles map[string]int) (string, err
 				if tbl != nil {
 					tbl.depth--
 					if tbl.depth == 0 {
-						flushTable(tbl)
+						err := flushTable(tbl)
 						tbl = nil
+						if err != nil {
+							return "", err
+						}
 					}
 				}
 			}
@@ -312,5 +316,8 @@ func parseDocumentXMLWithStyles(r io.Reader, styles map[string]int) (string, err
 		}
 	}
 
+	if err := sb.Err(); err != nil {
+		return "", err
+	}
 	return strings.TrimSpace(sb.String()), nil
 }

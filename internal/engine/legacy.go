@@ -23,7 +23,7 @@ const legacyTimeout = 180 * time.Second
 func findSoffice() (string, error) {
 	if p := os.Getenv("GLEANN_SOFFICE"); p != "" {
 		if _, err := os.Stat(p); err != nil {
-			return "", fmt.Errorf("GLEANN_SOFFICE=%s: %w", p, err)
+			return "", fmt.Errorf("%w: GLEANN_SOFFICE=%s: %w", ErrBackendUnavailable, p, err)
 		}
 		return p, nil
 	}
@@ -32,7 +32,7 @@ func findSoffice() (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("legacy Office files (.doc/.xls/.ppt) need LibreOffice (install it or set GLEANN_SOFFICE), or save the file as .docx/.xlsx/.pptx")
+	return "", fmt.Errorf("%w: legacy Office files (.doc/.xls/.ppt) need LibreOffice (install it or set GLEANN_SOFFICE), or save the file as .docx/.xlsx/.pptx", ErrBackendUnavailable)
 }
 
 // convertLegacyOffice converts path to its OOXML twin inside a temporary
@@ -46,7 +46,7 @@ func convertLegacyOffice(ctx context.Context, path string) (string, func(), erro
 	if err != nil {
 		return "", nil, err
 	}
-	dir, err := os.MkdirTemp("", "gleann-legacy-*")
+	dir, err := os.MkdirTemp(TempDir(), "gleann-legacy-*")
 	if err != nil {
 		return "", nil, err
 	}
@@ -61,7 +61,13 @@ func convertLegacyOffice(ctx context.Context, path string) (string, func(), erro
 		"--headless", "--norestore", "--convert-to", target, "--outdir", dir, path)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("LibreOffice failed on %s: %v: %s", filepath.Base(path), err, strings.TrimSpace(string(out)))
+		// Keep the cause in the chain: a kill by the deadline or a cancelled
+		// request carries the context error (504/503), an exit status stays an
+		// *exec.ExitError (422).
+		if cerr := ctx.Err(); cerr != nil {
+			return "", nil, fmt.Errorf("LibreOffice failed on %s: %w: %w: %s", filepath.Base(path), cerr, err, strings.TrimSpace(string(out)))
+		}
+		return "", nil, fmt.Errorf("LibreOffice failed on %s: %w: %s", filepath.Base(path), err, strings.TrimSpace(string(out)))
 	}
 	out := filepath.Join(dir, strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))+"."+target)
 	if _, err := os.Stat(out); err != nil {
