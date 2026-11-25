@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,19 +69,14 @@ type Server struct {
 	maxMarkdown int64  // largest Markdown result returned (413 above)
 	tempDir     string // per-instance temp directory, set by Serve
 
-	// Admission control (P7): at most maxConcurrent conversions run at once
-	// and at most queueBound more wait for a slot; further requests are
+	// Admission control (P7): conversions are split into a heavy and a light
+	// class (see lane.go). Each class runs at most its limit at once and lets
+	// at most its queue bound more wait; further requests of that class are
 	// refused with 429 + Retry-After instead of piling up until the host's
-	// timeout. GLEANN_DOCS_MAX_CONCURRENCY / GLEANN_DOCS_MAX_QUEUE configure
-	// the limits (queue 0: no waiting at all).
-	maxConcurrent int
-	queueBound    int
-	admitCh       chan struct{} // tickets: running + waiting conversions
-	runCh         chan struct{} // running conversion slots
-	queued        atomic.Int64  // conversions waiting for a run slot
-
-	durMu     sync.Mutex
-	durations []time.Duration // recent finished conversion durations (cancelled ones excluded) (Retry-After)
+	// timeout. The GLEANN_DOCS_MAX_HEAVY / _MAX_LIGHT / _HEAVY_QUEUE /
+	// _LIGHT_QUEUE settings configure the limits (queue 0: no waiting at all).
+	heavy *lane
+	light *lane
 
 	baseCtx    context.Context // parent of every request context; cancelled to unblock handlers at the shutdown deadline
 	cancelBase context.CancelFunc
@@ -108,7 +101,8 @@ const maxUploadBytes = 256 << 20
 // CPUs (capped) run conversions while a bounded queue holds the rest.
 const (
 	defaultQueueBound    = 8
-	maxConcurrentCap     = 8   // upper bound of the GOMAXPROCS/2 default
+	defaultHeavyRunning  = 2   // OCR, VLM, LibreOffice and PDF/image work
+	maxLightCap          = 8   // upper bound of the NumCPU default for light work
 	defaultUploadIdleSec = 30  // GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT, seconds
 	defaultUploadMaxSec  = 600 // GLEANN_DOCS_UPLOAD_MAX_TIME, seconds
 	readHeaderTimeout    = 15 * time.Second
@@ -116,15 +110,9 @@ const (
 	durationSamples      = 16
 )
 
-func defaultMaxConcurrent() int {
-	n := runtime.GOMAXPROCS(0) / 2
-	if n < 1 {
-		n = 1
-	}
-	if n > maxConcurrentCap {
-		n = maxConcurrentCap
-	}
-	return n
+// defaultLightRunning is NumCPU (GOMAXPROCS), at least 1, at most maxLightCap.
+func defaultLightRunning() int {
+	return min(max(runtime.GOMAXPROCS(0), 1), maxLightCap)
 }
 
 // envPositiveInt reads a positive integer setting; anything else keeps def.
@@ -149,23 +137,21 @@ func New(eng engine.Converter, port int) *Server {
 		port = 8765
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	maxConc := envPositiveInt("GLEANN_DOCS_MAX_CONCURRENCY", defaultMaxConcurrent())
-	queue := envNonNegInt("GLEANN_DOCS_MAX_QUEUE", defaultQueueBound)
 	return &Server{
-		eng:           eng,
-		port:          port,
-		token:         os.Getenv("GLEANN_DOCS_TOKEN"),
-		pluginToken:   os.Getenv("GLEANN_PLUGIN_TOKEN"),
-		maxMarkdown:   engine.MaxMarkdownBytes(),
-		maxConcurrent: maxConc,
-		queueBound:    queue,
-		admitCh:       make(chan struct{}, maxConc+queue),
-		runCh:         make(chan struct{}, maxConc),
-		baseCtx:       ctx,
-		cancelBase:    cancel,
-		drainCh:       make(chan struct{}),
-		uploadMax:     time.Duration(envPositiveInt("GLEANN_DOCS_UPLOAD_MAX_TIME", defaultUploadMaxSec)) * time.Second,
-		uploadIdle:    time.Duration(envPositiveInt("GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT", defaultUploadIdleSec)) * time.Second,
+		eng:         eng,
+		port:        port,
+		token:       os.Getenv("GLEANN_DOCS_TOKEN"),
+		pluginToken: os.Getenv("GLEANN_PLUGIN_TOKEN"),
+		maxMarkdown: engine.MaxMarkdownBytes(),
+		heavy: newLane(classHeavy, envPositiveInt("GLEANN_DOCS_MAX_HEAVY", defaultHeavyRunning),
+			envNonNegInt("GLEANN_DOCS_HEAVY_QUEUE", defaultQueueBound)),
+		light: newLane(classLight, envPositiveInt("GLEANN_DOCS_MAX_LIGHT", defaultLightRunning()),
+			envNonNegInt("GLEANN_DOCS_LIGHT_QUEUE", defaultQueueBound)),
+		baseCtx:    ctx,
+		cancelBase: cancel,
+		drainCh:    make(chan struct{}),
+		uploadMax:  time.Duration(envPositiveInt("GLEANN_DOCS_UPLOAD_MAX_TIME", defaultUploadMaxSec)) * time.Second,
+		uploadIdle: time.Duration(envPositiveInt("GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT", defaultUploadIdleSec)) * time.Second,
 	}
 }
 
@@ -366,41 +352,15 @@ func (s *Server) draining() bool {
 	}
 }
 
-// writeUnavailable answers 503 with a Retry-After estimate.
-func (s *Server) writeUnavailable(w http.ResponseWriter, msg string) {
-	w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds()))
+// writeUnavailable answers 503 with a Retry-After estimate: ln's when the
+// request's class is known, the longer of both classes otherwise.
+func (s *Server) writeUnavailable(w http.ResponseWriter, ln *lane, msg string) {
+	if ln != nil {
+		w.Header().Set("Retry-After", ln.retryAfter())
+	} else {
+		w.Header().Set("Retry-After", s.retryAfterAny())
+	}
 	writeError(w, http.StatusServiceUnavailable, msg)
-}
-
-// acquireRun waits for a conversion slot. It returns errDraining when shutdown
-// has started and the context's error when the client went away; on nil the
-// caller owns a slot. The state is re-checked after the slot is taken because
-// select picks among ready cases at random.
-func (s *Server) acquireRun(ctx context.Context) error {
-	select {
-	case s.runCh <- struct{}{}:
-	default:
-		s.queued.Add(1)
-		select {
-		case s.runCh <- struct{}{}:
-			s.queued.Add(-1)
-		case <-ctx.Done():
-			s.queued.Add(-1)
-			return ctx.Err()
-		case <-s.drainCh:
-			s.queued.Add(-1)
-			return errDraining
-		}
-	}
-	if s.draining() {
-		<-s.runCh
-		return errDraining
-	}
-	if err := ctx.Err(); err != nil {
-		<-s.runCh
-		return err
-	}
-	return nil
 }
 
 var errDraining = errors.New("server is shutting down")
@@ -466,7 +426,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"schema_version":  SchemaVersion,
 		"capabilities":    Capabilities,
 		"timeout":         TimeoutSec,
-		"max_concurrency": s.maxConcurrent,
+		"max_concurrency": s.heavy.maxRunning + s.light.maxRunning,
+		"concurrency":     map[string]any{classHeavy: s.heavy.status(), classLight: s.light.status()},
 		"backends":        backends,
 		"missing":         missing,
 	})
@@ -494,28 +455,23 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 	// threshold; the body itself is capped so an oversized upload is refused
 	// instead of being spooled to disk and decoded (P-05).
 	if s.eng == nil {
-		s.writeUnavailable(w, "engine is not configured")
+		s.writeUnavailable(w, nil, "engine is not configured")
 		return
 	}
 
 	if s.draining() {
-		s.writeUnavailable(w, "server is shutting down")
+		s.writeUnavailable(w, nil, "server is shutting down")
 		return
 	}
 
-	// Admission (P7): take a ticket before the body is read. When running +
-	// waiting conversions are at the cap, refuse now with 429 and Retry-After
-	// instead of hanging until the host's timeout.
-	select {
-	case s.admitCh <- struct{}{}:
-	default:
-		w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds()))
-		writeError(w, http.StatusTooManyRequests, "too many conversions in progress; retry after the indicated delay")
-		return
+	// Admission (P7): the upload's class is known from its extension, so the
+	// ticket of that class is taken as soon as the file part starts, before
+	// its body is read. When running + waiting conversions of the class are
+	// at the cap, spoolUpload refuses with 429 and that class's Retry-After.
+	ln, tmpPath, filename, ext, ok := s.spoolUpload(w, r)
+	if ln != nil {
+		defer ln.releaseTicket()
 	}
-	defer func() { <-s.admitCh }()
-
-	tmpPath, filename, ext, ok := s.spoolUpload(w, r)
 	if !ok {
 		return
 	}
@@ -523,26 +479,26 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 
 	// The upload is fully read (to EOF), so net/http now watches the
 	// connection: a client that disconnects while queued cancels r.Context().
-	if err := s.acquireRun(r.Context()); err != nil {
+	if err := ln.acquire(r.Context(), s); err != nil {
 		if errors.Is(err, errDraining) {
-			s.writeUnavailable(w, "server is shutting down")
+			s.writeUnavailable(w, ln, "server is shutting down")
 		} else {
-			s.writeUnavailable(w, "conversion wait cancelled")
+			s.writeUnavailable(w, ln, "conversion wait cancelled")
 		}
 		return
 	}
-	defer func() { <-s.runCh }()
+	defer ln.release()
 
 	start := time.Now()
 	markdown, pageCount, err := s.eng.Convert(r.Context(), tmpPath)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			s.recordDuration(time.Since(start))
+			ln.recordDuration(time.Since(start))
 		}
-		s.writeConvertError(w, err)
+		s.writeConvertError(w, ln, err)
 		return
 	}
-	s.recordDuration(time.Since(start))
+	ln.recordDuration(time.Since(start))
 	if int64(len(markdown)) > s.maxMarkdown {
 		writeError(w, http.StatusRequestEntityTooLarge,
 			fmt.Sprintf("converted text is %d bytes, over the %d byte limit (GLEANN_DOCS_MAX_MARKDOWN_BYTES)", len(markdown), s.maxMarkdown))
@@ -569,12 +525,12 @@ func isExtensionSupported(ext string) bool {
 // writeConvertError maps a conversion failure to a status code: a client that
 // went away gets no body, corrupt input 422, a missing backend 503, an input
 // over a limit 413, a deadline 504; anything else stays 500.
-func (s *Server) writeConvertError(w http.ResponseWriter, err error) {
+func (s *Server) writeConvertError(w http.ResponseWriter, ln *lane, err error) {
 	msg := fmt.Sprintf("conversion failed: %v", err)
 	switch {
 	case errors.Is(err, context.Canceled):
 		// The client is gone (or the server is shutting down): nobody reads a body.
-		w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds()))
+		w.Header().Set("Retry-After", ln.retryAfter())
 		w.WriteHeader(http.StatusServiceUnavailable)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusGatewayTimeout, msg)
@@ -583,46 +539,10 @@ func (s *Server) writeConvertError(w http.ResponseWriter, err error) {
 	case errors.Is(err, engine.ErrCorruptInput):
 		writeError(w, http.StatusUnprocessableEntity, msg)
 	case errors.Is(err, engine.ErrBackendUnavailable):
-		s.writeUnavailable(w, msg)
+		s.writeUnavailable(w, ln, msg)
 	default:
 		writeError(w, http.StatusInternalServerError, msg)
 	}
-}
-
-// recordDuration keeps the last durationSamples finished conversion
-// durations for the Retry-After estimate.
-func (s *Server) recordDuration(d time.Duration) {
-	s.durMu.Lock()
-	defer s.durMu.Unlock()
-	if len(s.durations) >= durationSamples {
-		copy(s.durations, s.durations[1:])
-		s.durations[len(s.durations)-1] = d
-		return
-	}
-	s.durations = append(s.durations, d)
-}
-
-// retryAfterSeconds estimates how long until a request arriving now would get
-// a slot: its queue position / concurrency x the recent median conversion
-// duration (1 s before any sample), clamped to 1..retryAfterMax seconds.
-func (s *Server) retryAfterSeconds() int {
-	s.durMu.Lock()
-	ds := slices.Clone(s.durations)
-	s.durMu.Unlock()
-	median := time.Second
-	if len(ds) > 0 {
-		slices.Sort(ds)
-		median = ds[len(ds)/2]
-	}
-	pos := float64(s.queued.Load() + 1)
-	secs := int(math.Ceil(pos / float64(s.maxConcurrent) * median.Seconds()))
-	if secs < 1 {
-		secs = 1
-	}
-	if secs > retryAfterMax {
-		secs = retryAfterMax
-	}
-	return secs
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
@@ -714,9 +634,10 @@ func (f failWriter) Write(p []byte) (int, error) {
 // spoolUpload streams the "file" part of the multipart body straight into one
 // file in the per-user temp root (no second copy, nothing in the system temp
 // directory), under the size cap and an idle read deadline. On success the
-// caller owns (and removes) the file; on any failure the response is written
+// caller owns (and removes) the file and the ticket of the returned lane
+// (non-nil whenever a ticket is held, also on failure); on any failure the response is written
 // and the file is already gone.
-func (s *Server) spoolUpload(w http.ResponseWriter, r *http.Request) (tmpPath, filename, ext string, ok bool) {
+func (s *Server) spoolUpload(w http.ResponseWriter, r *http.Request) (ln *lane, tmpPath, filename, ext string, ok bool) {
 	rc := http.NewResponseController(w)
 	r.Body = &idleBody{ReadCloser: http.MaxBytesReader(w, r.Body, maxUploadBytes), rc: rc, idle: s.uploadIdle, final: time.Now().Add(s.uploadMax)}
 	// The deadline must not outlive the upload: net/http's connection watcher
@@ -764,6 +685,14 @@ func (s *Server) spoolUpload(w http.ResponseWriter, r *http.Request) (tmpPath, f
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("Unsupported extension: %s", ext))
 			return
 		}
+		class := s.classFor(ext)
+		want := s.laneFor(class)
+		if !want.tryTicket() {
+			w.Header().Set("Retry-After", want.retryAfter())
+			writeError(w, http.StatusTooManyRequests, "too many "+class+" conversions in progress; retry after the indicated delay")
+			return
+		}
+		ln = want
 		tmpFile, err := os.CreateTemp(engine.TempDir(), "gleann_upload_*"+ext)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("create temp file: %v", err))
@@ -784,6 +713,6 @@ func (s *Server) spoolUpload(w http.ResponseWriter, r *http.Request) (tmpPath, f
 			fail(err)
 			return
 		}
-		return tmpPath, filename, ext, true
+		return ln, tmpPath, filename, ext, true
 	}
 }

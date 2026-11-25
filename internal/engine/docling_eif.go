@@ -196,6 +196,11 @@ func (e *EIFDoclingEngine) loadModelLocked() error {
 	return nil
 }
 
+// ImageTextAvailable reports whether OCR or the VLM is configured, i.e.
+// whether embedded pictures are read (docx, pptx, epub) and PDFs without a text
+// layer are readable. It never waits for a model run.
+func (e *EIFDoclingEngine) ImageTextAvailable() bool { return e.IsAvailable() }
+
 func (e *EIFDoclingEngine) IsAvailable() bool {
 	if e == nil {
 		return false
@@ -555,6 +560,40 @@ func pdfPageTexts(ctx context.Context, pdfPath string) ([]string, error) {
 	return pages, nil
 }
 
+// errPDFRestricted marks a PDF whose permissions forbid text extraction
+// (pdftotext exit 3). It is also an ErrCorruptInput, but OCR can still read the
+// rendered pages, so the caller falls back to it when it is available.
+var errPDFRestricted = errors.New("the PDF is encrypted or does not allow text extraction")
+
+// pdfParseError reports a PDF that pdftotext itself refuses to parse as
+// ErrCorruptInput. pdftotext exits 1 when the file cannot be opened or parsed
+// and 3 when its permissions forbid extraction. Exit 1 only counts as damaged
+// input when the spooled file exists and is readable: otherwise the failure is
+// the server's (a 500 without any path). A cancelled or timed-out context, a
+// missing binary and a child killed by a signal return nil and keep their own
+// classification. Messages name no path.
+func pdfParseError(ctx context.Context, pdfPath string, err error) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return nil
+	}
+	switch exitErr.ExitCode() {
+	case 1:
+		f, oerr := os.Open(pdfPath)
+		if oerr != nil {
+			return errors.New("cannot read the uploaded PDF on the server")
+		}
+		_ = f.Close()
+		return fmt.Errorf("%w: the PDF is damaged or truncated and cannot be parsed (pdftotext exit 1)", ErrCorruptInput)
+	case 3:
+		return fmt.Errorf("%w: %w (pdftotext exit 3)", ErrCorruptInput, errPDFRestricted)
+	}
+	return nil
+}
+
 func nonSpaceChars(s string) int {
 	n := 0
 	for _, r := range s {
@@ -623,6 +662,14 @@ func (e *EIFDoclingEngine) convertPDF(ctx context.Context, pdfPath string) (stri
 
 	pages, err := pdfPageTexts(ctx, pdfPath)
 	if err != nil {
+		if cerr := pdfParseError(ctx, pdfPath, err); cerr != nil {
+			// A copy-restricted PDF can still be read by OCR/VLM from its
+			// rendered pages; everything else is final.
+			if errors.Is(cerr, errPDFRestricted) && e.canReadScanned() {
+				return e.convertPDFAllVLM(ctx, pdfPath)
+			}
+			return "", 0, cerr
+		}
 		log.Printf("[docling-eif] pdftotext failed (%v)", err)
 		pages = nil
 	}

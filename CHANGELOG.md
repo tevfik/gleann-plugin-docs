@@ -19,12 +19,23 @@
 - The temp-path mask matches on a path boundary: `/var/tmp/...` and `/tmpfoo` are no longer rewritten when the
   temp directory is `/tmp`.
 
+- A broken, truncated or garbage PDF (and an encrypted one) answers 422 with a clear message and no internal
+  path instead of 500: pdftotext exit codes 1 and 3 are `ErrCorruptInput`. Exit 1 counts only when the spooled
+  file exists and is readable (otherwise 500, no path); a copy-restricted PDF (exit 3) is still read through
+  OCR/VLM when available and is 422 only without it. A missing binary, a signal, a cancelled or timed-out
+  conversion and I/O errors keep their own status and are never 422.
+
 ### Added
 
-- Bounded conversion admission (P7): at most `GLEANN_DOCS_MAX_CONCURRENCY` conversions run at once (default
-  `GOMAXPROCS/2`, capped at 8) and at most `GLEANN_DOCS_MAX_QUEUE` more wait for a slot (default 8, 0 disables
-  waiting). A request arriving when both are full is refused before its body is read with
-  `429 Too Many Requests`. The upload is read in full (within the 256 MB cap) before the wait for a slot, so a
+- Per-class conversion limits (P7): heavy work (`.pdf`, images, `.xls`, LibreOffice/anydoc formats, and docx/pptx/epub while OCR or the VLM is enabled) and light work
+  (xlsx, html, text; docx, pptx and epub unless OCR/VLM is on) have separate run slots, queues and `Retry-After` estimates, chosen from the
+  extension before a slot is taken. `GLEANN_DOCS_MAX_HEAVY` (default 2), `GLEANN_DOCS_HEAVY_QUEUE` (8),
+  `GLEANN_DOCS_MAX_LIGHT` (default NumCPU, capped at 8) and `GLEANN_DOCS_LIGHT_QUEUE` (8) configure them; a full
+  heavy queue no longer blocks light requests. `/health` reports both under `concurrency` and keeps
+  `max_concurrency` as their sum. Worst-case memory is the per-conversion caps x (heavy + light), disk
+  (running + queue of both) x 256 MB; see the README.
+- Bounded conversion admission (P7): a request arriving when its class has no free ticket is refused before the
+  file body is read with `429 Too Many Requests`. The upload is read in full (within the 256 MB cap) before the wait for a slot, so a
   client that disconnects while queued frees its seat and its conversion never starts (net/http only notices a
   closed connection once the body has been read); the context is checked again once the slot is taken.
   `/health` advertises `max_concurrency` (additive; `status` stays `ok`) and keeps answering while all slots
@@ -32,13 +43,13 @@
   seconds (default 30) without a byte or `GLEANN_DOCS_UPLOAD_MAX_TIME` seconds (default 600) in total (the
   conversion phase is not limited by it), and the server has a 15 s `ReadHeaderTimeout`, so a stalled client cannot
   hold a ticket. Each upload is spooled once, into the per-user temp root only (the multipart parser no longer
-  writes a second copy under the system temp directory). A single shared limit applies to all formats; per-class limits (heavy vs light) are a follow-up.
-- Every 503 and the 429 carry `Retry-After`: queue position / concurrency x the recent median conversion time,
-  clamped to 1..60 s.
+  writes a second copy under the system temp directory).
+- Every 503 and the 429 carry `Retry-After`: the class's queue position / concurrency x its recent median
+  conversion time, clamped to 1..60 s.
 - On shutdown, queued requests that have not started are refused with 503 + `Retry-After` and no new
   conversion starts during the grace period; running conversions drain.
 - README documents the settings, the worst-case disk and memory (concurrency + queue tickets x 256 MB of
-  spooled uploads, concurrency x per-conversion caps) and the 429/503 semantics.
+  spooled uploads, (heavy + light) x per-conversion caps) and the 429/503 semantics.
 - CI type-checks the cgo `anydoc` wrapper with `go vet -tags anydoc` (libanydoc itself is not built in CI).
 
 ## [1.5.5]

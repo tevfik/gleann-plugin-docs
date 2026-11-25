@@ -32,8 +32,8 @@ func rawUpload(t *testing.T, addr, name string) net.Conn {
 // and its conversion must never start. (net/http only notices a closed peer
 // once the body has been read, so the body is spooled before the wait.)
 func TestDisconnectedWaiterFreesSeatOverTCP(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "1")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "1")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "1")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "1")
 	eng := newBlockEngine()
 	srv := New(eng, 8765)
 	ts := httptest.NewServer(srv.Handler())
@@ -49,9 +49,9 @@ func TestDisconnectedWaiterFreesSeatOverTCP(t *testing.T) {
 	c2.Close() // the client goes away
 
 	deadline := time.Now().Add(3 * time.Second)
-	for srv.queued.Load() != 0 || len(srv.admitCh) != 1 {
+	for srv.light.queued.Load() != 0 || len(srv.light.admitCh) != 1 {
 		if time.Now().After(deadline) {
-			t.Fatalf("disconnected waiter still holds its seat: queued=%d tickets=%d", srv.queued.Load(), len(srv.admitCh))
+			t.Fatalf("disconnected waiter still holds its seat: queued=%d tickets=%d", srv.light.queued.Load(), len(srv.light.admitCh))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -94,8 +94,8 @@ func TestEvery503CarriesRetryAfter(t *testing.T) {
 // Once shutdown starts, a queued request that has not begun is refused with
 // 503 + Retry-After and never starts a conversion; the running one drains.
 func TestShutdownRefusesQueuedWaiters(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "1")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "2")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "1")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "2")
 	eng := newBlockEngine()
 	srv := New(eng, 8765)
 
@@ -131,21 +131,21 @@ func TestShutdownRefusesQueuedWaiters(t *testing.T) {
 
 // Retry-After = queue position / concurrency x typical duration, 1..60 s.
 func TestRetryAfterIsParallelismAwareAndClamped(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "4")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "8")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "4")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "8")
 	srv := New(&mockEngine{}, 8765)
 	for i := 0; i < 3; i++ {
-		srv.recordDuration(8 * time.Second)
+		srv.light.recordDuration(8 * time.Second)
 	}
-	srv.queued.Store(7) // position 8 -> 8/4 x 8 s
-	if got := srv.retryAfterSeconds(); got != 16 {
+	srv.light.queued.Store(7) // position 8 -> 8/4 x 8 s
+	if got := srv.light.retryAfterSeconds(); got != 16 {
 		t.Fatalf("Retry-After = %d, want 16", got)
 	}
-	srv.recordDuration(900 * time.Second)
+	srv.light.recordDuration(900 * time.Second)
 	for i := 0; i < 16; i++ {
-		srv.recordDuration(900 * time.Second)
+		srv.light.recordDuration(900 * time.Second)
 	}
-	if got := srv.retryAfterSeconds(); got != 60 {
+	if got := srv.light.retryAfterSeconds(); got != 60 {
 		t.Fatalf("Retry-After = %d, want clamp 60", got)
 	}
 }
@@ -170,10 +170,10 @@ func TestAcquireRunRechecksContext(t *testing.T) {
 	srv := New(&mockEngine{}, 8765)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := srv.acquireRun(ctx); err == nil {
+	if err := srv.light.acquire(ctx, srv); err == nil {
 		t.Fatal("acquireRun succeeded with a cancelled context")
 	}
-	if len(srv.runCh) != 0 {
-		t.Fatalf("slot leaked: %d held", len(srv.runCh))
+	if len(srv.light.runCh) != 0 {
+		t.Fatalf("slot leaked: %d held", len(srv.light.runCh))
 	}
 }

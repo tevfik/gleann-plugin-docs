@@ -16,8 +16,8 @@ import (
 // A client that sends headers and part of the body, then stalls, must lose its
 // ticket within the upload idle timeout, and the next request must not be 429.
 func TestStalledUploadReleasesTicket(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "1")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "0")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "1")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "0")
 	t.Setenv("GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT", "1")
 	srv := New(&mockEngine{}, 8765)
 	ts := httptest.NewServer(srv.Handler())
@@ -30,19 +30,22 @@ func TestStalledUploadReleasesTicket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	// The ticket is taken once the file part's headers are in, so send those
+	// plus 100 bytes of the file and then stall.
+	sent := strings.Index(body.String(), "\r\n\r\n") + 4 + 100
 	fmt.Fprintf(conn, "POST /convert HTTP/1.1\r\nHost: %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n%s",
-		addr, ct, body.Len(), body.String()[:100])
+		addr, ct, body.Len(), body.String()[:sent])
 
 	deadline := time.Now().Add(500 * time.Millisecond)
-	for len(srv.admitCh) != 1 && time.Now().Before(deadline) {
+	for len(srv.light.admitCh) != 1 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if len(srv.admitCh) != 1 {
+	if len(srv.light.admitCh) != 1 {
 		t.Fatal("stalled upload never took a ticket")
 	}
 	// Idle timeout 1 s: the ticket must be back well within 4 s.
 	deadline = time.Now().Add(4 * time.Second)
-	for len(srv.admitCh) != 0 {
+	for len(srv.light.admitCh) != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("stalled upload still holds its ticket")
 		}
@@ -71,8 +74,8 @@ func TestUploadSpoolsOnceIntoRoot(t *testing.T) {
 	}
 	setEngineTempDir(t, root)
 
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "1")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "1")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "1")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "1")
 	eng := newBlockEngine()
 	srv := New(eng, 8765)
 
@@ -126,8 +129,8 @@ func TestUploadSpoolsOnceIntoRoot(t *testing.T) {
 // A slow-drip client (one byte every 400 ms, always inside the idle limit)
 // still loses its ticket once the total upload time is over.
 func TestSlowDripUploadHitsTotalDeadline(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "1")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "0")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "1")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "0")
 	t.Setenv("GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT", "1")
 	t.Setenv("GLEANN_DOCS_UPLOAD_MAX_TIME", "2")
 	srv := New(&mockEngine{}, 8765)
@@ -152,7 +155,7 @@ func TestSlowDripUploadHitsTotalDeadline(t *testing.T) {
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	time.Sleep(300 * time.Millisecond)
-	for len(srv.admitCh) != 0 {
+	for len(srv.light.admitCh) != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("slow-drip upload still holds its ticket")
 		}

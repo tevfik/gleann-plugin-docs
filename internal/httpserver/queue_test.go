@@ -51,9 +51,9 @@ func waitStarted(t *testing.T, e *blockEngine, n int) {
 func waitQueued(t *testing.T, srv *Server, n int64) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for srv.queued.Load() != n {
+	for srv.light.queued.Load() != n {
 		if time.Now().After(deadline) {
-			t.Fatalf("queued = %d, want %d", srv.queued.Load(), n)
+			t.Fatalf("queued = %d, want %d", srv.light.queued.Load(), n)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -82,8 +82,8 @@ func uploadRequestFor(name string) *http.Request {
 // With max_concurrency=2 and queue=1, four parallel requests give two running
 // conversions, one waiter and exactly one 429 with Retry-After.
 func TestBoundedQueueReturns429WithRetryAfter(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "2")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "1")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "2")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "1")
 	eng := newBlockEngine()
 	srv := New(eng, 8765)
 
@@ -122,8 +122,8 @@ func TestBoundedQueueReturns429WithRetryAfter(t *testing.T) {
 
 // A cancelled waiter leaves the queue, freeing its seat for the next request.
 func TestCancelledWaiterLeavesTheQueue(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "1")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "1")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "1")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "1")
 	eng := newBlockEngine()
 	srv := New(eng, 8765)
 
@@ -167,8 +167,8 @@ func TestCancelledWaiterLeavesTheQueue(t *testing.T) {
 
 // /health keeps answering while every conversion slot is busy.
 func TestHealthResponsiveWhileBusy(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "1")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "0")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "1")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "0")
 	eng := newBlockEngine()
 	srv := New(eng, 8765)
 
@@ -183,8 +183,9 @@ func TestHealthResponsiveWhileBusy(t *testing.T) {
 	if data["status"] != "ok" {
 		t.Fatalf("status = %v, want ok", data["status"])
 	}
-	if data["max_concurrency"] != float64(1) {
-		t.Fatalf("max_concurrency = %v, want 1", data["max_concurrency"])
+	light, _ := data["concurrency"].(map[string]any)["light"].(map[string]any)
+	if light["max_concurrency"] != float64(1) || light["running"] != float64(1) {
+		t.Fatalf("light = %v, want max_concurrency 1 and 1 running", light)
 	}
 	// queue=0: the second request is refused immediately.
 	if rec := post(t, srv, "b.txt", []byte("x")); rec.Code != http.StatusTooManyRequests {
@@ -196,56 +197,68 @@ func TestHealthResponsiveWhileBusy(t *testing.T) {
 	}
 }
 
-func TestHealthAdvertisesMaxConcurrency(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "3")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "2")
+func TestHealthAdvertisesBothClasses(t *testing.T) {
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "3")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "2")
+	t.Setenv("GLEANN_DOCS_MAX_HEAVY", "1")
+	t.Setenv("GLEANN_DOCS_HEAVY_QUEUE", "5")
 	srv := New(&mockEngine{}, 8765)
 	data := healthOf(t, srv)
 	if data["status"] != "ok" {
 		t.Fatalf("status = %v, want ok", data["status"])
 	}
-	if data["max_concurrency"] != float64(3) {
-		t.Fatalf("max_concurrency = %v, want 3", data["max_concurrency"])
+	if data["max_concurrency"] != float64(4) {
+		t.Fatalf("max_concurrency = %v, want 4 (1 heavy + 3 light)", data["max_concurrency"])
+	}
+	c, _ := data["concurrency"].(map[string]any)
+	for class, want := range map[string][2]float64{"heavy": {1, 5}, "light": {3, 2}} {
+		e, _ := c[class].(map[string]any)
+		if e["max_concurrency"] != want[0] || e["max_queue"] != want[1] {
+			t.Errorf("%s = %v, want max_concurrency %v max_queue %v", class, e, want[0], want[1])
+		}
+		if e["running"] != float64(0) || e["queued"] != float64(0) {
+			t.Errorf("%s = %v, want idle", class, e)
+		}
 	}
 }
 
 func TestDefaultAdmissionLimits(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "")
+	for _, k := range []string{"MAX_HEAVY", "MAX_LIGHT", "HEAVY_QUEUE", "LIGHT_QUEUE"} {
+		t.Setenv("GLEANN_DOCS_"+k, "")
+	}
 	srv := New(&mockEngine{}, 8765)
-	if srv.maxConcurrent != defaultMaxConcurrent() {
-		t.Fatalf("maxConcurrent = %d, want default %d", srv.maxConcurrent, defaultMaxConcurrent())
+	if srv.heavy.maxRunning != 2 || srv.light.maxRunning != defaultLightRunning() {
+		t.Fatalf("running = heavy %d light %d, want 2 and %d", srv.heavy.maxRunning, srv.light.maxRunning, defaultLightRunning())
 	}
-	if srv.queueBound != defaultQueueBound {
-		t.Fatalf("queueBound = %d, want %d", srv.queueBound, defaultQueueBound)
+	if n := srv.light.maxRunning; n < 1 || n > 8 {
+		t.Fatalf("light default %d outside 1..8", n)
 	}
-	data := healthOf(t, srv)
-	if data["max_concurrency"] != float64(srv.maxConcurrent) {
-		t.Fatalf("max_concurrency = %v, want %d", data["max_concurrency"], srv.maxConcurrent)
+	if srv.heavy.queueBound != defaultQueueBound || srv.light.queueBound != defaultQueueBound {
+		t.Fatalf("queue bounds = %d, %d, want %d", srv.heavy.queueBound, srv.light.queueBound, defaultQueueBound)
 	}
 }
 
 // Retry-After grows with the recent conversion duration.
 func TestRetryAfterFromRecentDurations(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "2")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "4")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "2")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "4")
 	srv := New(&mockEngine{}, 8765)
-	if got := srv.retryAfterSeconds(); got != 1 {
+	if got := srv.light.retryAfterSeconds(); got != 1 {
 		t.Fatalf("no samples: Retry-After = %d, want 1", got)
 	}
 	for i := 0; i < 3; i++ {
-		srv.recordDuration(2 * time.Second)
+		srv.light.recordDuration(2 * time.Second)
 	}
-	srv.queued.Store(3) // position 4 / 2 slots x 2 s
-	if got := srv.retryAfterSeconds(); got != 4 {
+	srv.light.queued.Store(3) // position 4 / 2 slots x 2 s
+	if got := srv.light.retryAfterSeconds(); got != 4 {
 		t.Fatalf("Retry-After = %d, want 4", got)
 	}
 }
 
 // Concurrent conversions stay within the configured cap (run with -race).
 func TestConcurrentConvertsRespectTheCap(t *testing.T) {
-	t.Setenv("GLEANN_DOCS_MAX_CONCURRENCY", "3")
-	t.Setenv("GLEANN_DOCS_MAX_QUEUE", "16")
+	t.Setenv("GLEANN_DOCS_MAX_LIGHT", "3")
+	t.Setenv("GLEANN_DOCS_LIGHT_QUEUE", "16")
 	eng := newBlockEngine()
 	srv := New(eng, 8765)
 

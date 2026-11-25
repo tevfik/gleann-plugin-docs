@@ -134,21 +134,28 @@ Every route, `/health` included, requires a loopback `Host` (`localhost`, `127.0
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `GLEANN_DOCS_MAX_CONCURRENCY` | `GOMAXPROCS/2`, minimum 1, at most 8 | conversions that run at once |
-| `GLEANN_DOCS_MAX_QUEUE` | 8 | further requests that may wait for a slot (0: no waiting) |
+| `GLEANN_DOCS_MAX_HEAVY` | 2 | heavy conversions that run at once |
+| `GLEANN_DOCS_HEAVY_QUEUE` | 8 | further heavy requests that may wait for a slot (0: no waiting) |
+| `GLEANN_DOCS_MAX_LIGHT` | `NumCPU`, minimum 1, at most 8 | light conversions that run at once |
+| `GLEANN_DOCS_LIGHT_QUEUE` | 8 | further light requests that may wait for a slot (0: no waiting) |
 | `GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT` | 30 | seconds without a single upload byte before the request is aborted with `408` and its ticket and file are released (the server also drops connections that take over 15 s to send their headers) |
 | `GLEANN_DOCS_UPLOAD_MAX_TIME` | 600 | seconds the whole upload may take (a slow drip that stays inside the idle limit still gets `408`); the conversion that follows is not covered |
 
-There are no command-line flags for these; `/health` reports `max_concurrency`. There is a single shared limit for every format; separate limits for heavy (PDF, OCR, images) and light formats are a follow-up.
+There are no command-line flags for these. Work is split into two classes, each with its own run slots, queue and `Retry-After`, so a backlog of scans never blocks a docx:
 
-- A request takes a ticket first (running + waiting at most `MAX_CONCURRENCY + MAX_QUEUE`). With no ticket free it gets `429 Too Many Requests` at once, before its body is read.
-- It then uploads (bounded by the 256 MB cap) and waits for a run slot in arrival order. The upload is read in full before the wait, so a client that disconnects while queued is noticed and its seat is released; its conversion never starts.
-- `Retry-After` (seconds, always 1..60) is on every 429 and every 503: queue position / concurrency x the recent median conversion time.
+- **heavy**: `.pdf`, images (`.png .jpg .jpeg .tif .tiff .bmp .webp`), the formats that go through LibreOffice or anydoc (`.doc .ppt .odt .ods .odp .rtf`) and `.xls` (its native reader can fall back to LibreOffice). Also `.docx`, `.pptx` and `.epub` while OCR or the VLM is enabled on this server (they read every embedded picture then).
+- **light**: everything else (`.xlsx .html .htm .csv .txt .md`, and `.docx .pptx .epub` while neither OCR nor the VLM is enabled).
+
+The class is decided from the file extension and the server's OCR/VLM configuration (the same answer as `IsAvailable`, taken without waiting for a model run) before a slot is taken. There are no per-request options. `/health` reports `max_concurrency` (heavy + light) and `concurrency` with `max_concurrency`, `max_queue`, `running` and `queued` for each class.
+
+- A request takes a ticket of its class as soon as the file part's headers have been read (running + waiting at most `MAX_<class> + <class>_QUEUE`). With no ticket free it gets `429 Too Many Requests` at once, before the file body is read; a full heavy queue never refuses a light request and the other way round.
+- It then uploads (bounded by the 256 MB cap) and waits for a run slot of its class in arrival order. The upload is read in full before the wait, so a client that disconnects while queued is noticed and its seat is released; its conversion never starts. A client that stalls is aborted with `408` after the idle timeout and releases its ticket.
+- `Retry-After` (seconds, always 1..60) is on every 429 and every 503: the class's queue position / the class's concurrency x the class's recent median conversion time. A 503 written before the class is known (shutdown, no engine) uses the longer of the two estimates.
 - On SIGINT/SIGTERM, waiting requests that have not started get `503` with `Retry-After`, and no new conversion starts during the grace period; running ones finish.
 
-Worst-case resources per instance: each upload is written once, straight into the plugin's per-user temp directory (never into the system temp directory), so disk is up to (`MAX_CONCURRENCY + MAX_QUEUE`) x 256 MB, 4 GiB at the defaults on a 16-core host (8 running + 8 waiting). RAM is only the running conversions: up to `MAX_CONCURRENCY` x (64 MiB Markdown budget plus the builder's copies and the zip data being read; see the limits above). Lower `GLEANN_DOCS_MAX_CONCURRENCY` on small machines.
+Worst-case resources per instance: each upload is written once, straight into the plugin's per-user temp directory (never into the system temp directory), so disk is up to (`MAX_HEAVY + HEAVY_QUEUE + MAX_LIGHT + LIGHT_QUEUE`) x 256 MB. At the defaults on a 16-core host that is (2 + 8 + 8 + 8) x 256 MB = 26 x 256 MB = 6.5 GiB. RAM is only the running conversions: up to (`MAX_HEAVY + MAX_LIGHT`) x (per-conversion caps: 64 MiB Markdown budget plus the builder's copies and the zip data being read, up to 1 GiB of zip data; see the limits above), 10 conversions at the defaults on a 16-core host. Heavy conversions also hold page images and, with the VLM, model state, so lower `GLEANN_DOCS_MAX_HEAVY` first, and `GLEANN_DOCS_MAX_LIGHT` on small machines.
 
-`/convert` answers 413 for an input over a limit, 422 for a damaged file (or a missing `file` field), 503 when the format needs a backend this install lacks (scanned PDF without OCR, `.odt` without `anydoc`, `.doc` without LibreOffice), 504 when the request deadline passes, 400 for an unsupported extension.
+`/convert` answers 413 for an input over a limit, 422 for a damaged file (a truncated or garbage PDF, an encrypted PDF, a bad zip; or a missing `file` field), 503 when the format needs a backend this install lacks (scanned PDF without OCR, `.odt` without `anydoc`, `.doc` without LibreOffice), 504 when the request deadline passes, 400 for an unsupported extension.
 
 A conversion that is cancelled (the client disconnected, or the plugin is shutting down) answers 503 (with `Retry-After`) and an empty body, also when the cancelled child process (pdftotext, pdftoppm, LibreOffice, anydoc) reports a failure; it is never 422 or 500. A timeout answers 504. An image whose decoder panics is 422; an image over the pixel budget is 413.
 
