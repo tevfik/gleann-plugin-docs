@@ -123,6 +123,13 @@ func TestServeSweepsOnlyItsOwnTempDir(t *testing.T) {
 	waitListening(t, port)
 	defer s.Close()
 
+	// Serve binds the port before it prepares the temp directory and runs the
+	// sweep, so a successful dial does not mean the sweep has finished: wait
+	// for its (last) effect instead of racing it.
+	for i := 0; i < 500 && exists(tmp+"/gleann-img-old.png"); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	if exists(own + "/gleann_upload_stale.docx") {
 		t.Error("a leftover in this instance's temp directory survived the startup sweep")
 	}
