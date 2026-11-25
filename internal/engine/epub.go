@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -48,7 +49,7 @@ func ExtractEPUB(filePath string) (string, int, error) {
 func extractEPUB(ob *outBudget, filePath string) (string, int, error) {
 	z, err := zip.OpenReader(filePath)
 	if err != nil {
-		return "", 0, fmt.Errorf("open epub zip %s: %w", filePath, err)
+		return "", 0, fmt.Errorf("open epub zip %s: %w", filepath.Base(filePath), err)
 	}
 	defer z.Close()
 
@@ -67,7 +68,7 @@ func extractEPUB(ob *outBudget, filePath string) (string, int, error) {
 	}
 
 	if len(chapterFiles) == 0 {
-		return "", 0, fmt.Errorf("no readable chapters found in epub %s", filePath)
+		return "", 0, fmt.Errorf("no readable chapters found in epub %s", filepath.Base(filePath))
 	}
 
 	// Index zip entries by normalized path
@@ -119,7 +120,7 @@ func extractEPUB(ob *outBudget, filePath string) (string, int, error) {
 	}
 
 	if len(chapters) == 0 {
-		return "", 0, fmt.Errorf("failed to extract content from epub %s", filePath)
+		return "", 0, fmt.Errorf("failed to extract content from epub %s", filepath.Base(filePath))
 	}
 
 	joined, err := joinBudgeted(ob, chapters, "\n\n---\n\n")

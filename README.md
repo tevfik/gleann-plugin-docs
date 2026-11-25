@@ -130,9 +130,27 @@ Every route, `/health` included, requires a loopback `Host` (`localhost`, `127.0
 | zip members (docx, xlsx, pptx, epub, odt, ods, odp) | 10000 entries, 256 MiB per member, 1 GiB total, 200:1 expansion; the total also caps all zip data read during one conversion, so a member that is referenced many times is paid for each read (repeated slide, sheet and spine references are dropped; embedded pictures are read one at a time and count too); xlsx columns past XFD and rows past 1,048,576 are 422; tables wider than 16,384 columns are 422, and a table whose padded size would pass the Markdown cap is 413 before it is rendered | `GLEANN_DOCS_ZIP_MAX_ENTRIES`, `GLEANN_DOCS_ZIP_MAX_ENTRY_BYTES`, `GLEANN_DOCS_ZIP_MAX_TOTAL_BYTES` |
 | Markdown result | 64 MiB, enforced while the result is built (413 as soon as it is crossed) | `GLEANN_DOCS_MAX_MARKDOWN_BYTES` |
 
+### Concurrency, queue and load shedding
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `GLEANN_DOCS_MAX_CONCURRENCY` | `GOMAXPROCS/2`, minimum 1, at most 8 | conversions that run at once |
+| `GLEANN_DOCS_MAX_QUEUE` | 8 | further requests that may wait for a slot (0: no waiting) |
+| `GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT` | 30 | seconds without a single upload byte before the request is aborted with `408` and its ticket and file are released (the server also drops connections that take over 15 s to send their headers) |
+| `GLEANN_DOCS_UPLOAD_MAX_TIME` | 600 | seconds the whole upload may take (a slow drip that stays inside the idle limit still gets `408`); the conversion that follows is not covered |
+
+There are no command-line flags for these; `/health` reports `max_concurrency`. There is a single shared limit for every format; separate limits for heavy (PDF, OCR, images) and light formats are a follow-up.
+
+- A request takes a ticket first (running + waiting at most `MAX_CONCURRENCY + MAX_QUEUE`). With no ticket free it gets `429 Too Many Requests` at once, before its body is read.
+- It then uploads (bounded by the 256 MB cap) and waits for a run slot in arrival order. The upload is read in full before the wait, so a client that disconnects while queued is noticed and its seat is released; its conversion never starts.
+- `Retry-After` (seconds, always 1..60) is on every 429 and every 503: queue position / concurrency x the recent median conversion time.
+- On SIGINT/SIGTERM, waiting requests that have not started get `503` with `Retry-After`, and no new conversion starts during the grace period; running ones finish.
+
+Worst-case resources per instance: each upload is written once, straight into the plugin's per-user temp directory (never into the system temp directory), so disk is up to (`MAX_CONCURRENCY + MAX_QUEUE`) x 256 MB, 4 GiB at the defaults on a 16-core host (8 running + 8 waiting). RAM is only the running conversions: up to `MAX_CONCURRENCY` x (64 MiB Markdown budget plus the builder's copies and the zip data being read; see the limits above). Lower `GLEANN_DOCS_MAX_CONCURRENCY` on small machines.
+
 `/convert` answers 413 for an input over a limit, 422 for a damaged file (or a missing `file` field), 503 when the format needs a backend this install lacks (scanned PDF without OCR, `.odt` without `anydoc`, `.doc` without LibreOffice), 504 when the request deadline passes, 400 for an unsupported extension.
 
-A conversion that is cancelled (the client disconnected, or the plugin is shutting down) answers 503 with an empty body, also when the cancelled child process (pdftotext, pdftoppm, LibreOffice, anydoc) reports a failure; it is never 422 or 500. A timeout answers 504. An image whose decoder panics is 422; an image over the pixel budget is 413.
+A conversion that is cancelled (the client disconnected, or the plugin is shutting down) answers 503 (with `Retry-After`) and an empty body, also when the cancelled child process (pdftotext, pdftoppm, LibreOffice, anydoc) reports a failure; it is never 422 or 500. A timeout answers 504. An image whose decoder panics is 422; an image over the pixel budget is 413.
 
 Temporary files live in `<temp dir>/gleann-plugin-docs-<uid>/<port>/` (the user name replaces the uid on Windows); the plugin empties the port directory at startup and when it shuts down. The per-user root must be a real directory owned by the current user and not writable by group or others; otherwise the plugin logs it, uses the system temp directory and skips the cleanup of leftovers from earlier versions (which only ever removes plain files and directories with this plugin's own names, never symbolic links). On SIGINT/SIGTERM it lets running conversions finish for `GLEANN_PLUGIN_STOP_GRACE` (default 10 s, as gleann uses) minus one second, then cancels them.
 

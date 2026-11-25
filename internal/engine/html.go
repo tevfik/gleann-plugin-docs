@@ -7,6 +7,7 @@ import (
 	"html"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	nethtml "golang.org/x/net/html"
@@ -20,7 +21,7 @@ func ExtractHTMLFile(filePath string) (string, error) {
 func extractHTMLFile(ob *outBudget, filePath string) (string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return "", fmt.Errorf("read html file %s: %w", filePath, err)
+		return "", fmt.Errorf("read html file %s: %w", filepath.Base(filePath), err)
 	}
 	return extractHTML(ob, bytes.NewReader(data))
 }
@@ -33,7 +34,9 @@ func ExtractHTML(r io.Reader) (string, error) { return extractHTML(newOutBudget(
 func extractHTML(ob *outBudget, r io.Reader) (string, error) {
 	doc, err := nethtml.Parse(r)
 	if err != nil {
-		return "", fmt.Errorf("parse html: %w", err)
+		// The parser refuses hostile input (e.g. nesting deeper than 512
+		// open elements): that is a client error (422), not a server failure.
+		return "", fmt.Errorf("%w: parse html: %w", ErrCorruptInput, err)
 	}
 
 	sb := newMDBuilderOn(ob)
@@ -75,7 +78,7 @@ func (c *htmlConverter) walk(n *nethtml.Node) {
 		return
 	}
 	// After the first refusal (budget or table size) nothing more is rendered.
-	if c.buf.ob.err != nil || (c.err != nil && *c.err != nil) {
+	if c.buf.ob.stickyErr() != nil || (c.err != nil && *c.err != nil) {
 		return
 	}
 
@@ -292,8 +295,8 @@ func (c *htmlConverter) renderTable(tableNode *nethtml.Node) {
 
 	// Pad, project and render through the shared table writer.
 	if err := writeTable(c.buf, rows, remainingBudget(c.buf), tableOpts{trailingNewline: true}); err != nil {
-		if errors.Is(err, ErrTooLarge) && c.buf.ob.err == nil {
-			c.buf.ob.err = err // sticky: the rest of the conversion is refused too
+		if errors.Is(err, ErrTooLarge) {
+			c.buf.ob.setStickyErr(err) // sticky: the rest of the conversion is refused too
 		}
 		if c.err != nil && *c.err == nil {
 			*c.err = err

@@ -40,7 +40,7 @@ func findSoffice() (string, error) {
 func convertLegacyOffice(ctx context.Context, path string) (string, func(), error) {
 	target, ok := legacyTarget[strings.ToLower(filepath.Ext(path))]
 	if !ok {
-		return "", nil, fmt.Errorf("not a legacy Office file: %s", path)
+		return "", nil, fmt.Errorf("not a legacy Office file: %s", filepath.Base(path))
 	}
 	soffice, err := findSoffice()
 	if err != nil {

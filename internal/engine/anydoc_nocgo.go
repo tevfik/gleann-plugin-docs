@@ -47,10 +47,10 @@ func convertAnyDoc(ctx context.Context, filePath string) (string, error) {
 	cmd := exec.CommandContext(ctx, anydocBin, filePath)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("anydoc CLI: %w", err)
+		return "", fmt.Errorf("%w: anydoc CLI: %w", ErrBackendUnavailable, err)
 	}
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("anydoc CLI failed: %w", err)
+		return "", fmt.Errorf("%w: anydoc CLI failed to start: %w", ErrBackendUnavailable, err)
 	}
 	// Bound the output at the Markdown cap so a runaway converter cannot fill memory.
 	limit := MaxMarkdownBytes()

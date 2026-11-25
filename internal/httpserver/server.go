@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,9 +71,29 @@ type Server struct {
 	maxMarkdown int64  // largest Markdown result returned (413 above)
 	tempDir     string // per-instance temp directory, set by Serve
 
+	// Admission control (P7): at most maxConcurrent conversions run at once
+	// and at most queueBound more wait for a slot; further requests are
+	// refused with 429 + Retry-After instead of piling up until the host's
+	// timeout. GLEANN_DOCS_MAX_CONCURRENCY / GLEANN_DOCS_MAX_QUEUE configure
+	// the limits (queue 0: no waiting at all).
+	maxConcurrent int
+	queueBound    int
+	admitCh       chan struct{} // tickets: running + waiting conversions
+	runCh         chan struct{} // running conversion slots
+	queued        atomic.Int64  // conversions waiting for a run slot
+
+	durMu     sync.Mutex
+	durations []time.Duration // recent finished conversion durations (cancelled ones excluded) (Retry-After)
+
 	baseCtx    context.Context // parent of every request context; cancelled to unblock handlers at the shutdown deadline
 	cancelBase context.CancelFunc
 	inflight   atomic.Int64 // /convert-style requests currently running
+
+	uploadIdle time.Duration // no upload bytes for this long aborts the request (408)
+	uploadMax  time.Duration // total upload time limit (408); the conversion phase is not covered
+
+	drainCh   chan struct{} // closed when shutdown starts: waiters are refused, no new conversion starts
+	drainOnce sync.Once
 }
 
 // drainGrace is how long Shutdown waits, after cancelling the request
@@ -80,19 +104,68 @@ const drainGrace = 800 * time.Millisecond
 // maxUploadBytes bounds the request body of /convert.
 const maxUploadBytes = 256 << 20
 
+// Admission defaults (P7). The host sends up to 16 files at once; half the
+// CPUs (capped) run conversions while a bounded queue holds the rest.
+const (
+	defaultQueueBound    = 8
+	maxConcurrentCap     = 8   // upper bound of the GOMAXPROCS/2 default
+	defaultUploadIdleSec = 30  // GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT, seconds
+	defaultUploadMaxSec  = 600 // GLEANN_DOCS_UPLOAD_MAX_TIME, seconds
+	readHeaderTimeout    = 15 * time.Second
+	retryAfterMax        = 60 // Retry-After is clamped to 1..60 s
+	durationSamples      = 16
+)
+
+func defaultMaxConcurrent() int {
+	n := runtime.GOMAXPROCS(0) / 2
+	if n < 1 {
+		n = 1
+	}
+	if n > maxConcurrentCap {
+		n = maxConcurrentCap
+	}
+	return n
+}
+
+// envPositiveInt reads a positive integer setting; anything else keeps def.
+func envPositiveInt(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+		return v
+	}
+	return def
+}
+
+// envNonNegInt reads a non-negative integer setting (0 is meaningful for the
+// queue bound: no waiting); anything else keeps def.
+func envNonNegInt(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v >= 0 {
+		return v
+	}
+	return def
+}
+
 func New(eng engine.Converter, port int) *Server {
 	if port <= 0 {
 		port = 8765
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	maxConc := envPositiveInt("GLEANN_DOCS_MAX_CONCURRENCY", defaultMaxConcurrent())
+	queue := envNonNegInt("GLEANN_DOCS_MAX_QUEUE", defaultQueueBound)
 	return &Server{
-		eng:         eng,
-		port:        port,
-		token:       os.Getenv("GLEANN_DOCS_TOKEN"),
-		pluginToken: os.Getenv("GLEANN_PLUGIN_TOKEN"),
-		maxMarkdown: engine.MaxMarkdownBytes(),
-		baseCtx:     ctx,
-		cancelBase:  cancel,
+		eng:           eng,
+		port:          port,
+		token:         os.Getenv("GLEANN_DOCS_TOKEN"),
+		pluginToken:   os.Getenv("GLEANN_PLUGIN_TOKEN"),
+		maxMarkdown:   engine.MaxMarkdownBytes(),
+		maxConcurrent: maxConc,
+		queueBound:    queue,
+		admitCh:       make(chan struct{}, maxConc+queue),
+		runCh:         make(chan struct{}, maxConc),
+		baseCtx:       ctx,
+		cancelBase:    cancel,
+		drainCh:       make(chan struct{}),
+		uploadMax:     time.Duration(envPositiveInt("GLEANN_DOCS_UPLOAD_MAX_TIME", defaultUploadMaxSec)) * time.Second,
+		uploadIdle:    time.Duration(envPositiveInt("GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT", defaultUploadIdleSec)) * time.Second,
 	}
 }
 
@@ -216,8 +289,9 @@ func (s *Server) Serve() error {
 		return nil
 	}
 	srv := &http.Server{
-		Handler:     s.Handler(),
-		BaseContext: func(net.Listener) context.Context { return s.baseCtx },
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		BaseContext:       func(net.Listener) context.Context { return s.baseCtx },
 	}
 	s.httpSrv = srv
 	s.mu.Unlock()
@@ -258,6 +332,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.stopped = true
 	srv := s.httpSrv
 	s.mu.Unlock()
+	s.beginDrain()
 
 	var err error
 	if srv != nil {
@@ -277,6 +352,58 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	return err
 }
+
+// beginDrain starts the drain: queued requests that have not begun are refused
+// with 503 + Retry-After and no new conversion starts; running ones finish.
+func (s *Server) beginDrain() { s.drainOnce.Do(func() { close(s.drainCh) }) }
+
+func (s *Server) draining() bool {
+	select {
+	case <-s.drainCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// writeUnavailable answers 503 with a Retry-After estimate.
+func (s *Server) writeUnavailable(w http.ResponseWriter, msg string) {
+	w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds()))
+	writeError(w, http.StatusServiceUnavailable, msg)
+}
+
+// acquireRun waits for a conversion slot. It returns errDraining when shutdown
+// has started and the context's error when the client went away; on nil the
+// caller owns a slot. The state is re-checked after the slot is taken because
+// select picks among ready cases at random.
+func (s *Server) acquireRun(ctx context.Context) error {
+	select {
+	case s.runCh <- struct{}{}:
+	default:
+		s.queued.Add(1)
+		select {
+		case s.runCh <- struct{}{}:
+			s.queued.Add(-1)
+		case <-ctx.Done():
+			s.queued.Add(-1)
+			return ctx.Err()
+		case <-s.drainCh:
+			s.queued.Add(-1)
+			return errDraining
+		}
+	}
+	if s.draining() {
+		<-s.runCh
+		return errDraining
+	}
+	if err := ctx.Err(); err != nil {
+		<-s.runCh
+		return err
+	}
+	return nil
+}
+
+var errDraining = errors.New("server is shutting down")
 
 // waitIdle waits until no request is running, at most d.
 func (s *Server) waitIdle(d time.Duration) {
@@ -299,6 +426,7 @@ func (s *Server) Close() error {
 	s.stopped = true
 	srv := s.httpSrv
 	s.mu.Unlock()
+	s.beginDrain()
 
 	s.cancelBase()
 	if srv != nil {
@@ -332,14 +460,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":         "ok",
-		"plugin":         PluginName,
-		"version":        PluginVersion,
-		"schema_version": SchemaVersion,
-		"capabilities":   Capabilities,
-		"timeout":        TimeoutSec,
-		"backends":       backends,
-		"missing":        missing,
+		"status":          "ok",
+		"plugin":          PluginName,
+		"version":         PluginVersion,
+		"schema_version":  SchemaVersion,
+		"capabilities":    Capabilities,
+		"timeout":         TimeoutSec,
+		"max_concurrency": s.maxConcurrent,
+		"backends":        backends,
+		"missing":         missing,
 	})
 }
 
@@ -365,55 +494,55 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 	// threshold; the body itself is capped so an oversized upload is refused
 	// instead of being spooled to disk and decoded (P-05).
 	if s.eng == nil {
-		writeError(w, http.StatusServiceUnavailable, "engine is not configured")
+		s.writeUnavailable(w, "engine is not configured")
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds %d MB", maxUploadBytes>>20))
-			return
-		}
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse multipart: %v", err))
+	if s.draining() {
+		s.writeUnavailable(w, "server is shutting down")
 		return
 	}
 
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, 422, fmt.Sprintf("missing 'file' field: %v", err))
+	// Admission (P7): take a ticket before the body is read. When running +
+	// waiting conversions are at the cap, refuse now with 429 and Retry-After
+	// instead of hanging until the host's timeout.
+	select {
+	case s.admitCh <- struct{}{}:
+	default:
+		w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds()))
+		writeError(w, http.StatusTooManyRequests, "too many conversions in progress; retry after the indicated delay")
 		return
 	}
-	defer file.Close()
+	defer func() { <-s.admitCh }()
 
-	ext := strings.ToLower(filepath.Ext(header.Filename))
-	if !isExtensionSupported(ext) {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("Unsupported extension: %s", ext))
+	tmpPath, filename, ext, ok := s.spoolUpload(w, r)
+	if !ok {
 		return
 	}
-
-	// Save upload to temporary file
-	tmpFile, err := os.CreateTemp(engine.TempDir(), "gleann_upload_*"+ext)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("create temp file: %v", err))
-		return
-	}
-	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
-	if _, err := io.Copy(tmpFile, file); err != nil {
-		tmpFile.Close()
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write temp file: %v", err))
+	// The upload is fully read (to EOF), so net/http now watches the
+	// connection: a client that disconnects while queued cancels r.Context().
+	if err := s.acquireRun(r.Context()); err != nil {
+		if errors.Is(err, errDraining) {
+			s.writeUnavailable(w, "server is shutting down")
+		} else {
+			s.writeUnavailable(w, "conversion wait cancelled")
+		}
 		return
 	}
-	tmpFile.Close()
+	defer func() { <-s.runCh }()
 
+	start := time.Now()
 	markdown, pageCount, err := s.eng.Convert(r.Context(), tmpPath)
 	if err != nil {
-		writeConvertError(w, err)
+		if !errors.Is(err, context.Canceled) {
+			s.recordDuration(time.Since(start))
+		}
+		s.writeConvertError(w, err)
 		return
 	}
+	s.recordDuration(time.Since(start))
 	if int64(len(markdown)) > s.maxMarkdown {
 		writeError(w, http.StatusRequestEntityTooLarge,
 			fmt.Sprintf("converted text is %d bytes, over the %d byte limit (GLEANN_DOCS_MAX_MARKDOWN_BYTES)", len(markdown), s.maxMarkdown))
@@ -421,7 +550,7 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	docFormat := strings.TrimPrefix(ext, ".")
-	parsed := parser.ParseDocument(markdown, header.Filename, docFormat, pageCount)
+	parsed := parser.ParseDocument(markdown, filename, docFormat, pageCount)
 	parsed.Backend = s.eng.BackendName()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -440,11 +569,12 @@ func isExtensionSupported(ext string) bool {
 // writeConvertError maps a conversion failure to a status code: a client that
 // went away gets no body, corrupt input 422, a missing backend 503, an input
 // over a limit 413, a deadline 504; anything else stays 500.
-func writeConvertError(w http.ResponseWriter, err error) {
+func (s *Server) writeConvertError(w http.ResponseWriter, err error) {
 	msg := fmt.Sprintf("conversion failed: %v", err)
 	switch {
 	case errors.Is(err, context.Canceled):
 		// The client is gone (or the server is shutting down): nobody reads a body.
+		w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds()))
 		w.WriteHeader(http.StatusServiceUnavailable)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusGatewayTimeout, msg)
@@ -453,14 +583,207 @@ func writeConvertError(w http.ResponseWriter, err error) {
 	case errors.Is(err, engine.ErrCorruptInput):
 		writeError(w, http.StatusUnprocessableEntity, msg)
 	case errors.Is(err, engine.ErrBackendUnavailable):
-		writeError(w, http.StatusServiceUnavailable, msg)
+		s.writeUnavailable(w, msg)
 	default:
 		writeError(w, http.StatusInternalServerError, msg)
 	}
 }
 
+// recordDuration keeps the last durationSamples finished conversion
+// durations for the Retry-After estimate.
+func (s *Server) recordDuration(d time.Duration) {
+	s.durMu.Lock()
+	defer s.durMu.Unlock()
+	if len(s.durations) >= durationSamples {
+		copy(s.durations, s.durations[1:])
+		s.durations[len(s.durations)-1] = d
+		return
+	}
+	s.durations = append(s.durations, d)
+}
+
+// retryAfterSeconds estimates how long until a request arriving now would get
+// a slot: its queue position / concurrency x the recent median conversion
+// duration (1 s before any sample), clamped to 1..retryAfterMax seconds.
+func (s *Server) retryAfterSeconds() int {
+	s.durMu.Lock()
+	ds := slices.Clone(s.durations)
+	s.durMu.Unlock()
+	median := time.Second
+	if len(ds) > 0 {
+		slices.Sort(ds)
+		median = ds[len(ds)/2]
+	}
+	pos := float64(s.queued.Load() + 1)
+	secs := int(math.Ceil(pos / float64(s.maxConcurrent) * median.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	if secs > retryAfterMax {
+		secs = retryAfterMax
+	}
+	return secs
+}
+
 func writeError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": msg})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": maskTempPaths(msg)})
+}
+
+// maskTempPaths removes temporary-directory prefixes from an error message:
+// where the upload lives on the server's file system is an implementation
+// detail and must not reach the client (anydoc and os errors embed the full
+// path). Every error response goes through here, so no route can leak one.
+func maskTempPaths(msg string) string {
+	dirs := []string{engine.TempDir(), os.TempDir()}
+	// Longest first: the instance dir lives under the system temp dir.
+	if len(dirs[0]) < len(dirs[1]) {
+		dirs[0], dirs[1] = dirs[1], dirs[0]
+	}
+	for _, dir := range dirs {
+		if dir == "" || dir == string(filepath.Separator) {
+			continue
+		}
+		msg = maskDir(msg, dir)
+	}
+	return msg
+}
+
+// maskDir replaces dir by "<temp>" where it stands on a path boundary: not in
+// the middle of another path (/var/tmp is not /tmp) and not as the prefix of a
+// longer name (/tmpfoo).
+func maskDir(msg, dir string) string {
+	isName := func(c byte) bool {
+		return c == '_' || c == '-' || c == '.' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(msg, dir)
+		if i < 0 {
+			break
+		}
+		end := i + len(dir)
+		before := i == 0 || !(isName(msg[i-1]) || msg[i-1] == '/' || msg[i-1] == '\\')
+		after := end == len(msg) || !isName(msg[end])
+		b.WriteString(msg[:i])
+		if before && after {
+			b.WriteString("<temp>")
+		} else {
+			b.WriteString(dir)
+		}
+		msg = msg[end:]
+	}
+	b.WriteString(msg)
+	return b.String()
+}
+
+// idleBody refreshes the connection's read deadline before every read, so an
+// upload is aborted when no byte arrives for idle, however slowly it
+// otherwise flows. Without a deadline-capable writer (tests) it is a no-op.
+type idleBody struct {
+	io.ReadCloser
+	rc    *http.ResponseController
+	idle  time.Duration
+	final time.Time // absolute end of the upload phase
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	d := time.Now().Add(b.idle)
+	if d.After(b.final) {
+		d = b.final
+	}
+	_ = b.rc.SetReadDeadline(d)
+	return b.ReadCloser.Read(p)
+}
+
+// failWriter marks errors of the destination file so they are not mistaken
+// for upload read errors.
+type failWriter struct{ w io.Writer }
+
+type writeFailure struct{ error }
+
+func (f failWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if err != nil {
+		err = writeFailure{err}
+	}
+	return n, err
+}
+
+// spoolUpload streams the "file" part of the multipart body straight into one
+// file in the per-user temp root (no second copy, nothing in the system temp
+// directory), under the size cap and an idle read deadline. On success the
+// caller owns (and removes) the file; on any failure the response is written
+// and the file is already gone.
+func (s *Server) spoolUpload(w http.ResponseWriter, r *http.Request) (tmpPath, filename, ext string, ok bool) {
+	rc := http.NewResponseController(w)
+	r.Body = &idleBody{ReadCloser: http.MaxBytesReader(w, r.Body, maxUploadBytes), rc: rc, idle: s.uploadIdle, final: time.Now().Add(s.uploadMax)}
+	// The deadline must not outlive the upload: net/http's connection watcher
+	// (which detects a disconnect while queued) reads on the same connection.
+	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
+
+	fail := func(err error) {
+		var tooBig *http.MaxBytesError
+		var ne net.Error
+		var wf writeFailure
+		switch {
+		case errors.As(err, &wf):
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write temp file: %v", wf.error))
+		case errors.As(err, &tooBig):
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds %d MB", maxUploadBytes>>20))
+		case errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()):
+			w.Header().Set("Connection", "close")
+			writeError(w, http.StatusRequestTimeout, fmt.Sprintf("upload timed out: no data for %v or over %v in total", s.uploadIdle, s.uploadMax))
+		default:
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("parse multipart: %v", err))
+		}
+	}
+
+	mr, err := r.MultipartReader()
+	if err != nil {
+		fail(err)
+		return
+	}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			writeError(w, 422, "missing 'file' field: http: no such file")
+			return
+		}
+		if err != nil {
+			fail(err)
+			return
+		}
+		if part.FormName() != "file" || part.FileName() == "" {
+			continue // NextPart skips the unread rest of the part
+		}
+		filename = part.FileName()
+		ext = strings.ToLower(filepath.Ext(filename))
+		if !isExtensionSupported(ext) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("Unsupported extension: %s", ext))
+			return
+		}
+		tmpFile, err := os.CreateTemp(engine.TempDir(), "gleann_upload_*"+ext)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("create temp file: %v", err))
+			return
+		}
+		tmpPath = tmpFile.Name()
+		_, err = io.Copy(failWriter{tmpFile}, part)
+		if cerr := tmpFile.Close(); err == nil && cerr != nil {
+			err = writeFailure{cerr}
+		}
+		if err == nil {
+			// Read the rest of the body to EOF: net/http watches the
+			// connection for a disconnect only after that.
+			_, err = io.Copy(io.Discard, r.Body)
+		}
+		if err != nil {
+			_ = os.Remove(tmpPath)
+			fail(err)
+			return
+		}
+		return tmpPath, filename, ext, true
+	}
 }

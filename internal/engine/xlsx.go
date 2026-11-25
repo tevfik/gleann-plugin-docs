@@ -263,7 +263,7 @@ func parseWorksheet(budget *zipBudget, ob *outBudget, f *zip.File, sharedStrings
 	// Cells may point at one large shared string again and again; count the
 	// text they stand for so a small sheet cannot render gigabytes.
 	var cellBytes int64
-	maxBytes := ob.left
+	maxBytes := ob.remaining()
 
 	for {
 		tok, err := decoder.Token()

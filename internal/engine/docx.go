@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,7 +31,7 @@ func extractDocx(ob *outBudget, filePath string) (string, error) {
 		}
 	}
 	if docFile == nil {
-		return "", fmt.Errorf("word/document.xml not found in %s", filePath)
+		return "", fmt.Errorf("word/document.xml not found in %s", filepath.Base(filePath))
 	}
 
 	budget := newZipBudget()
@@ -59,12 +60,13 @@ var (
 
 // headingLevelFromName maps a style name to a Markdown heading level. Word
 // stores localized style ids ("Balk1") but the style *name* in styles.xml stays
-// in the canonical form ("heading 1").
+// in the canonical form ("heading 1"). Levels beyond Markdown's sixth clamp
+// to 6; a name that is not a heading returns 0.
 func headingLevelFromName(name string) int {
 	n := strings.ToLower(strings.TrimSpace(name))
 	if m := headingNameRe.FindStringSubmatch(n); m != nil {
-		if lvl, _ := strconv.Atoi(m[1]); lvl >= 1 && lvl <= 6 {
-			return lvl
+		if lvl, _ := strconv.Atoi(m[1]); lvl >= 1 {
+			return clampHeadingLevel(lvl)
 		}
 	}
 	if n == "title" {
@@ -230,7 +232,8 @@ func parseDocumentXMLWithStyles(ob *outBudget, r io.Reader, styles map[string]in
 						} else if lvl := headingLevelFromName(a.Value); lvl > 0 {
 							p.heading = lvl
 						} else if m := headingIDRe.FindStringSubmatch(a.Value); m != nil {
-							p.heading, _ = strconv.Atoi(m[1])
+							lvl, _ := strconv.Atoi(m[1])
+							p.heading = clampHeadingLevel(lvl)
 						}
 					}
 				}
@@ -238,8 +241,10 @@ func parseDocumentXMLWithStyles(ob *outBudget, r io.Reader, styles map[string]in
 				if p := cur(); p != nil && p.heading == 0 {
 					for _, a := range elem.Attr {
 						if a.Name.Local == "val" {
-							if n, err := strconv.Atoi(a.Value); err == nil && n >= 0 && n < 6 {
-								p.heading = n + 1
+							// Word outline levels 0..8 are headings 1..9 (9 is
+							// body text); deeper than Markdown's sixth clamps to 6.
+							if n, err := strconv.Atoi(a.Value); err == nil && n >= 0 && n < 9 {
+								p.heading = clampHeadingLevel(n + 1)
 							}
 						}
 					}

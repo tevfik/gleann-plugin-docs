@@ -47,6 +47,10 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # libanydoc is not built in CI; vet still type-checks the cgo wrapper.
+      - name: Vet (anydoc tag, type-check only)
+        run: go vet -tags anydoc ./internal/engine
+
       - name: Test
         run: go test -race -timeout 10m ./...
 

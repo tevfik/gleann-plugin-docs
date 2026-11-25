@@ -25,7 +25,7 @@ type tableOpts struct {
 // Markdown cap for the size-capped builder, the whole cap for anything else.
 func remainingBudget(w any) int64 {
 	if m, ok := w.(*mdBuilder); ok {
-		return m.ob.left
+		return m.ob.remaining()
 	}
 	// A writer that is not drawn on a conversion budget must not exist: the
 	// enforcement test (budget_test.go) rejects such buffers in the engine.

@@ -39,7 +39,7 @@ var budgetExemptions = map[string]string{
 // each entry says what bounds it.
 var repeatExemptions = map[string]string{
 	"html.go:walk:strings.Repeat":                        "heading level is the digit of an h1..h6 tag (1..6); list indent uses clampListLevel",
-	"docx.go:parseDocumentXMLWithStyles:strings.Repeat":  "heading is 1..6 (style and outline level checked) and listLvl is clamped by clampListLevel",
+	"docx.go:parseDocumentXMLWithStyles:strings.Repeat":  "heading is clamped to 1..6 by clampHeadingLevel (style id, style name and outline level) and listLvl by clampListLevel",
 	"pptx.go:extractSlideContent:strings.Repeat":         "level is clamped by clampListLevel when read",
 	"headings.go:promoteNumberedHeadings:strings.Repeat": "depth is capped at 5 just before the call",
 }

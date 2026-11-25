@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Limits on untrusted input. Each can be raised or lowered with an environment
@@ -126,8 +127,9 @@ func (b *boundedEntry) Close() error { return b.rc.Close() }
 // zipBudget is the number of uncompressed bytes one conversion may read from
 // its archive in total. Every openEntry charges it as the bytes are read, so a
 // member that is referenced (and therefore read) many times is paid for each
-// time. A nil budget is unlimited (tests).
+// time. A nil budget is unlimited (tests). charge is safe for concurrent use.
 type zipBudget struct {
+	mu   sync.Mutex
 	left int64
 }
 
@@ -145,6 +147,8 @@ func (b *zipBudget) charge(n int) error {
 	if b == nil {
 		return nil
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.left -= int64(n)
 	if b.left < 0 {
 		return fmt.Errorf("%w: the conversion reads more than the archive total limit of zip data (GLEANN_DOCS_ZIP_MAX_TOTAL_BYTES)", ErrTooLarge)
@@ -186,7 +190,8 @@ func openEntry(budget *zipBudget, f *zip.File) (io.ReadCloser, error) {
 // every buffer that holds output text (document, slide, cell, list, sheet and
 // page buffers). take charges it, give refunds a buffer that was merged into
 // its parent; once a charge fails the error is sticky. It travels with the
-// conversion through the context (budgetFrom).
+// conversion through the context (budgetFrom). All methods are safe for
+// concurrent use: parallel page or fragment producers share one budget.
 // maxListLevel is the deepest list indent that is rendered. Word and
 // PowerPoint define nine levels (0..8); a larger or negative value from the
 // document is clamped, never used as a repeat count.
@@ -202,7 +207,23 @@ func clampListLevel(n int) int {
 	return n
 }
 
+// maxHeadingLevel is the deepest heading Markdown has (######). Word styles
+// and outline levels go up to 9; anything deeper clamps to 6 instead of
+// emitting an invalid ####### heading.
+const maxHeadingLevel = 6
+
+func clampHeadingLevel(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > maxHeadingLevel {
+		return maxHeadingLevel
+	}
+	return n
+}
+
 type outBudget struct {
+	mu    sync.Mutex
 	left  int64
 	limit int64
 	err   error
@@ -215,6 +236,8 @@ func newOutBudget() *outBudget {
 
 // take charges n bytes; past the budget it fails with ErrTooLarge (sticky).
 func (b *outBudget) take(n int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.err != nil {
 		return b.err
 	}
@@ -227,7 +250,35 @@ func (b *outBudget) take(n int) error {
 }
 
 // give refunds n bytes that are no longer held.
-func (b *outBudget) give(n int) { b.left += int64(n) }
+func (b *outBudget) give(n int) {
+	b.mu.Lock()
+	b.left += int64(n)
+	b.mu.Unlock()
+}
+
+// remaining is how many more bytes the conversion may produce.
+func (b *outBudget) remaining() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.left
+}
+
+// stickyErr is the budget's sticky error, nil before the first refusal.
+func (b *outBudget) stickyErr() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err
+}
+
+// setStickyErr records err as the sticky refusal unless one is set already
+// (the first error wins).
+func (b *outBudget) setStickyErr(err error) {
+	b.mu.Lock()
+	if b.err == nil {
+		b.err = err
+	}
+	b.mu.Unlock()
+}
 
 type budgetKey struct{}
 
@@ -276,7 +327,7 @@ func (m *mdBuilder) Len() int       { return m.sb.Len() }
 func (m *mdBuilder) String() string { return m.sb.String() }
 
 // Err is the budget's sticky ErrTooLarge once it was exceeded, nil before.
-func (m *mdBuilder) Err() error { return m.ob.err }
+func (m *mdBuilder) Err() error { return m.ob.stickyErr() }
 
 // Discard drops the content and refunds what it charged: a fragment that was
 // copied into its parent (which charged it again) is released this way.

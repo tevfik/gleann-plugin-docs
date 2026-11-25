@@ -1,5 +1,46 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- HTML nested deeper than the parser's 512 open elements is refused with 422 (corrupt input) instead of an
+  untyped 500.
+- DOCX heading levels beyond Markdown's sixth clamp to `######`: style ids (`Heading9`, localized `Balk9`),
+  style names (`heading 9`) and `outlineLvl` 6..8 no longer emit an invalid `#######` heading or drop the
+  heading to plain text. Levels 1..6 are unchanged.
+- The per-conversion output budget and the zip read budget are safe for concurrent use (a mutex around the
+  remaining bytes and the sticky error); parallel page or fragment producers can share one budget without a
+  data race.
+- Error responses never reveal temporary file paths: every error message is masked at the single write
+  choke point (the instance temp dir and the system temp dir become `<temp>`), and the anydoc errors carry
+  only the file's base name. A failing in-process anydoc conversion is 422 (corrupt input), not 500; a
+  failing anydoc CLI start is 503 (backend unavailable).
+- The temp-path mask matches on a path boundary: `/var/tmp/...` and `/tmpfoo` are no longer rewritten when the
+  temp directory is `/tmp`.
+
+### Added
+
+- Bounded conversion admission (P7): at most `GLEANN_DOCS_MAX_CONCURRENCY` conversions run at once (default
+  `GOMAXPROCS/2`, capped at 8) and at most `GLEANN_DOCS_MAX_QUEUE` more wait for a slot (default 8, 0 disables
+  waiting). A request arriving when both are full is refused before its body is read with
+  `429 Too Many Requests`. The upload is read in full (within the 256 MB cap) before the wait for a slot, so a
+  client that disconnects while queued frees its seat and its conversion never starts (net/http only notices a
+  closed connection once the body has been read); the context is checked again once the slot is taken.
+  `/health` advertises `max_concurrency` (additive; `status` stays `ok`) and keeps answering while all slots
+  are busy. Uploads abort with 408 (ticket and spool file released) after `GLEANN_DOCS_UPLOAD_IDLE_TIMEOUT`
+  seconds (default 30) without a byte or `GLEANN_DOCS_UPLOAD_MAX_TIME` seconds (default 600) in total (the
+  conversion phase is not limited by it), and the server has a 15 s `ReadHeaderTimeout`, so a stalled client cannot
+  hold a ticket. Each upload is spooled once, into the per-user temp root only (the multipart parser no longer
+  writes a second copy under the system temp directory). A single shared limit applies to all formats; per-class limits (heavy vs light) are a follow-up.
+- Every 503 and the 429 carry `Retry-After`: queue position / concurrency x the recent median conversion time,
+  clamped to 1..60 s.
+- On shutdown, queued requests that have not started are refused with 503 + `Retry-After` and no new
+  conversion starts during the grace period; running conversions drain.
+- README documents the settings, the worst-case disk and memory (concurrency + queue tickets x 256 MB of
+  spooled uploads, concurrency x per-conversion caps) and the 429/503 semantics.
+- CI type-checks the cgo `anydoc` wrapper with `go vet -tags anydoc` (libanydoc itself is not built in CI).
+
 ## [1.5.5]
 
 ### Security

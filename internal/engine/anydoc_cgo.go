@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"unsafe"
 )
 
@@ -26,7 +27,7 @@ func anyDocAvailable(func(string) (string, error)) bool { return true }
 
 func convertAnyDoc(ctx context.Context, filePath string) (string, error) {
 	if _, err := os.Stat(filePath); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: cannot read %s", ErrCorruptInput, filepath.Base(filePath))
 	}
 
 	cPath := C.CString(filePath)
@@ -34,7 +35,9 @@ func convertAnyDoc(ctx context.Context, filePath string) (string, error) {
 
 	res := C.anydoc_convert(cPath)
 	if res == nil {
-		return "", fmt.Errorf("anydoc conversion failed for %s", filePath)
+		// Damaged input is a client error (422); the temporary upload path
+		// is an implementation detail and never goes into the message.
+		return "", fmt.Errorf("%w: anydoc conversion failed for %s", ErrCorruptInput, filepath.Base(filePath))
 	}
 	defer C.anydoc_free(res)
 

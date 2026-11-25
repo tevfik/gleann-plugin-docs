@@ -19,20 +19,26 @@ import (
 	"github.com/tevfik/gleann-plugin-docs/internal/engine"
 )
 
-// uploadRequest builds a multipart POST /convert request for one file.
-func uploadRequest(t *testing.T, name string, data []byte) *http.Request {
-	t.Helper()
+// multipartBody builds the multipart form body of one file upload.
+func multipartBody(name string, data []byte) (*bytes.Buffer, string) {
 	body := &bytes.Buffer{}
 	w := multipart.NewWriter(body)
 	part, err := w.CreateFormFile("file", name)
 	if err != nil {
-		t.Fatal(err)
+		panic(err) // bytes.Buffer writes cannot fail
 	}
 	_, _ = part.Write(data)
 	_ = w.Close()
+	return body, w.FormDataContentType()
+}
+
+// uploadRequest builds a multipart POST /convert request for one file.
+func uploadRequest(t *testing.T, name string, data []byte) *http.Request {
+	t.Helper()
+	body, contentType := multipartBody(name, data)
 	req := httptest.NewRequest("POST", "/convert", body)
 	req.Host = "127.0.0.1:8765"
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Content-Type", contentType)
 	return req
 }
 
