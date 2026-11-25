@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.5.6] — 2026-11-26
+
 ### Fixed
 
 - HTML nested deeper than the parser's 512 open elements is refused with 422 (corrupt input) instead of an
